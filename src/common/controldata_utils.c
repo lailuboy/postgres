@@ -4,7 +4,7 @@
  *		Common code for control data file output.
  *
  *
- * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -27,9 +27,12 @@
 #include "catalog/pg_control.h"
 #include "common/controldata_utils.h"
 #include "port/pg_crc32c.h"
+#ifndef FRONTEND
+#include "storage/fd.h"
+#endif
 
 /*
- * get_controlfile(char *DataDir, const char *progname, bool *crc_ok_p)
+ * get_controlfile()
  *
  * Get controlfile values.  The result is returned as a palloc'd copy of the
  * control file data.
@@ -44,19 +47,21 @@ get_controlfile(const char *DataDir, const char *progname, bool *crc_ok_p)
 	int			fd;
 	char		ControlFilePath[MAXPGPATH];
 	pg_crc32c	crc;
+	int			r;
 
 	AssertArg(crc_ok_p);
 
 	ControlFile = palloc(sizeof(ControlFileData));
 	snprintf(ControlFilePath, MAXPGPATH, "%s/global/pg_control", DataDir);
 
-	if ((fd = open(ControlFilePath, O_RDONLY | PG_BINARY, 0)) == -1)
 #ifndef FRONTEND
+	if ((fd = OpenTransientFile(ControlFilePath, O_RDONLY | PG_BINARY)) == -1)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not open file \"%s\" for reading: %m",
 						ControlFilePath)));
 #else
+	if ((fd = open(ControlFilePath, O_RDONLY | PG_BINARY, 0)) == -1)
 	{
 		fprintf(stderr, _("%s: could not open file \"%s\" for reading: %s\n"),
 				progname, ControlFilePath, strerror(errno));
@@ -64,20 +69,41 @@ get_controlfile(const char *DataDir, const char *progname, bool *crc_ok_p)
 	}
 #endif
 
-	if (read(fd, ControlFile, sizeof(ControlFileData)) != sizeof(ControlFileData))
-#ifndef FRONTEND
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not read file \"%s\": %m", ControlFilePath)));
-#else
+	r = read(fd, ControlFile, sizeof(ControlFileData));
+	if (r != sizeof(ControlFileData))
 	{
-		fprintf(stderr, _("%s: could not read file \"%s\": %s\n"),
-				progname, ControlFilePath, strerror(errno));
-		exit(EXIT_FAILURE);
-	}
+		if (r < 0)
+#ifndef FRONTEND
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not read file \"%s\": %m", ControlFilePath)));
+#else
+		{
+			fprintf(stderr, _("%s: could not read file \"%s\": %s\n"),
+					progname, ControlFilePath, strerror(errno));
+			exit(EXIT_FAILURE);
+		}
 #endif
+		else
+#ifndef FRONTEND
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("could not read file \"%s\": read %d of %zu",
+							ControlFilePath, r, sizeof(ControlFileData))));
+#else
+		{
+			fprintf(stderr, _("%s: could not read file \"%s\": read %d of %zu\n"),
+					progname, ControlFilePath, r, sizeof(ControlFileData));
+			exit(EXIT_FAILURE);
+		}
+#endif
+	}
 
+#ifndef FRONTEND
+	CloseTransientFile(fd);
+#else
 	close(fd);
+#endif
 
 	/* Check the CRC. */
 	INIT_CRC32C(crc);

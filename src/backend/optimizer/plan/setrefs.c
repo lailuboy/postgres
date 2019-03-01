@@ -4,7 +4,7 @@
  *	  Post-processing of a completed plan tree: fix references to subplan
  *	  vars, compute regproc values for operators, etc
  *
- * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -19,6 +19,7 @@
 #include "catalog/pg_type.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/planmain.h"
 #include "optimizer/planner.h"
@@ -104,6 +105,7 @@ static Node *fix_scan_expr_mutator(Node *node, fix_scan_expr_context *context);
 static bool fix_scan_expr_walker(Node *node, fix_scan_expr_context *context);
 static void set_join_references(PlannerInfo *root, Join *join, int rtoffset);
 static void set_upper_references(PlannerInfo *root, Plan *plan, int rtoffset);
+static void set_param_references(PlannerInfo *root, Plan *plan);
 static Node *convert_combining_aggrefs(Node *node, void *context);
 static void set_dummy_tlist_references(Plan *plan, int rtoffset);
 static indexed_tlist *build_tlist_index(List *tlist);
@@ -137,8 +139,7 @@ static List *set_returning_clause_references(PlannerInfo *root,
 								Plan *topplan,
 								Index resultRelation,
 								int rtoffset);
-static bool extract_query_dependencies_walker(Node *node,
-								  PlannerInfo *context);
+
 
 /*****************************************************************************
  *
@@ -174,8 +175,8 @@ static bool extract_query_dependencies_walker(Node *node,
  * This will be used by plancache.c to drive invalidation of cached plans.
  * Relation dependencies are represented by OIDs, and everything else by
  * PlanInvalItems (this distinction is motivated by the shared-inval APIs).
- * Currently, relations and user-defined functions are the only types of
- * objects that are explicitly tracked this way.
+ * Currently, relations, user-defined functions, and domains are the only
+ * types of objects that are explicitly tracked this way.
  *
  * 8. We assign every plan node in the tree a unique ID.
  *
@@ -340,7 +341,7 @@ flatten_unplanned_rtes(PlannerGlobal *glob, RangeTblEntry *rte)
 	(void) query_tree_walker(rte->subquery,
 							 flatten_rtes_walker,
 							 (void *) glob,
-							 QTW_EXAMINE_RTES);
+							 QTW_EXAMINE_RTES_BEFORE);
 }
 
 static bool
@@ -363,7 +364,7 @@ flatten_rtes_walker(Node *node, PlannerGlobal *glob)
 		return query_tree_walker((Query *) node,
 								 flatten_rtes_walker,
 								 (void *) glob,
-								 QTW_EXAMINE_RTES);
+								 QTW_EXAMINE_RTES_BEFORE);
 	}
 	return expression_tree_walker(node, flatten_rtes_walker,
 								  (void *) glob);
@@ -628,7 +629,10 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 
 		case T_Gather:
 		case T_GatherMerge:
-			set_upper_references(root, plan, rtoffset);
+			{
+				set_upper_references(root, plan, rtoffset);
+				set_param_references(root, plan);
+			}
 			break;
 
 		case T_Hash:
@@ -844,12 +848,10 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				}
 
 				splan->nominalRelation += rtoffset;
+				if (splan->rootRelation)
+					splan->rootRelation += rtoffset;
 				splan->exclRelRTI += rtoffset;
 
-				foreach(l, splan->partitioned_rels)
-				{
-					lfirst_int(l) += rtoffset;
-				}
 				foreach(l, splan->resultRelations)
 				{
 					lfirst_int(l) += rtoffset;
@@ -880,24 +882,17 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 								list_copy(splan->resultRelations));
 
 				/*
-				 * If the main target relation is a partitioned table, the
-				 * following list contains the RT indexes of partitioned child
-				 * relations including the root, which are not included in the
-				 * above list.  We also keep RT indexes of the roots
-				 * separately to be identitied as such during the executor
-				 * initialization.
+				 * If the main target relation is a partitioned table, also
+				 * add the partition root's RT index to rootResultRelations,
+				 * and remember its index in that list in rootResultRelIndex.
 				 */
-				if (splan->partitioned_rels != NIL)
+				if (splan->rootRelation)
 				{
-					root->glob->nonleafResultRelations =
-						list_concat(root->glob->nonleafResultRelations,
-									list_copy(splan->partitioned_rels));
-					/* Remember where this root will be in the global list. */
 					splan->rootResultRelIndex =
 						list_length(root->glob->rootResultRelations);
 					root->glob->rootResultRelations =
 						lappend_int(root->glob->rootResultRelations,
-									linitial_int(splan->partitioned_rels));
+									splan->rootRelation);
 				}
 			}
 			break;
@@ -911,15 +906,26 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				 */
 				set_dummy_tlist_references(plan, rtoffset);
 				Assert(splan->plan.qual == NIL);
-				foreach(l, splan->partitioned_rels)
-				{
-					lfirst_int(l) += rtoffset;
-				}
 				foreach(l, splan->appendplans)
 				{
 					lfirst(l) = set_plan_refs(root,
 											  (Plan *) lfirst(l),
 											  rtoffset);
+				}
+				if (splan->part_prune_info)
+				{
+					foreach(l, splan->part_prune_info->prune_infos)
+					{
+						List	   *prune_infos = lfirst(l);
+						ListCell   *l2;
+
+						foreach(l2, prune_infos)
+						{
+							PartitionedRelPruneInfo *pinfo = lfirst(l2);
+
+							pinfo->rtindex += rtoffset;
+						}
+					}
 				}
 			}
 			break;
@@ -933,15 +939,26 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				 */
 				set_dummy_tlist_references(plan, rtoffset);
 				Assert(splan->plan.qual == NIL);
-				foreach(l, splan->partitioned_rels)
-				{
-					lfirst_int(l) += rtoffset;
-				}
 				foreach(l, splan->mergeplans)
 				{
 					lfirst(l) = set_plan_refs(root,
 											  (Plan *) lfirst(l),
 											  rtoffset);
+				}
+				if (splan->part_prune_info)
+				{
+					foreach(l, splan->part_prune_info->prune_infos)
+					{
+						List	   *prune_infos = lfirst(l);
+						ListCell   *l2;
+
+						foreach(l2, prune_infos)
+						{
+							PartitionedRelPruneInfo *pinfo = lfirst(l2);
+
+							pinfo->rtindex += rtoffset;
+						}
+					}
 				}
 			}
 			break;
@@ -1395,12 +1412,6 @@ fix_expr_common(PlannerInfo *root, Node *node)
 		record_plan_function_dependency(root,
 										((ScalarArrayOpExpr *) node)->opfuncid);
 	}
-	else if (IsA(node, ArrayCoerceExpr))
-	{
-		if (OidIsValid(((ArrayCoerceExpr *) node)->elemfuncid))
-			record_plan_function_dependency(root,
-											((ArrayCoerceExpr *) node)->elemfuncid);
-	}
 	else if (IsA(node, Const))
 	{
 		Const	   *con = (Const *) node;
@@ -1746,8 +1757,8 @@ set_upper_references(PlannerInfo *root, Plan *plan, int rtoffset)
 		TargetEntry *tle = (TargetEntry *) lfirst(l);
 		Node	   *newexpr;
 
-		/* If it's a non-Var sort/group item, first try to match by sortref */
-		if (tle->ressortgroupref != 0 && !IsA(tle->expr, Var))
+		/* If it's a sort/group item, first try to match by sortref */
+		if (tle->ressortgroupref != 0)
 		{
 			newexpr = (Node *)
 				search_indexed_tlist_for_sortgroupref(tle->expr,
@@ -1781,6 +1792,51 @@ set_upper_references(PlannerInfo *root, Plan *plan, int rtoffset)
 					   rtoffset);
 
 	pfree(subplan_itlist);
+}
+
+/*
+ * set_param_references
+ *	  Initialize the initParam list in Gather or Gather merge node such that
+ *	  it contains reference of all the params that needs to be evaluated
+ *	  before execution of the node.  It contains the initplan params that are
+ *	  being passed to the plan nodes below it.
+ */
+static void
+set_param_references(PlannerInfo *root, Plan *plan)
+{
+	Assert(IsA(plan, Gather) ||IsA(plan, GatherMerge));
+
+	if (plan->lefttree->extParam)
+	{
+		PlannerInfo *proot;
+		Bitmapset  *initSetParam = NULL;
+		ListCell   *l;
+
+		for (proot = root; proot != NULL; proot = proot->parent_root)
+		{
+			foreach(l, proot->init_plans)
+			{
+				SubPlan    *initsubplan = (SubPlan *) lfirst(l);
+				ListCell   *l2;
+
+				foreach(l2, initsubplan->setParam)
+				{
+					initSetParam = bms_add_member(initSetParam, lfirst_int(l2));
+				}
+			}
+		}
+
+		/*
+		 * Remember the list of all external initplan params that are used by
+		 * the children of Gather or Gather merge node.
+		 */
+		if (IsA(plan, Gather))
+			((Gather *) plan)->initParam =
+				bms_intersect(plan->lefttree->extParam, initSetParam);
+		else
+			((GatherMerge *) plan)->initParam =
+				bms_intersect(plan->lefttree->extParam, initSetParam);
+	}
 }
 
 /*
@@ -2108,7 +2164,6 @@ search_indexed_tlist_for_non_var(Expr *node,
 
 /*
  * search_indexed_tlist_for_sortgroupref --- find a sort/group expression
- *		(which is assumed not to be just a Var)
  *
  * If a match is found, return a Var constructed to reference the tlist item.
  * If no match, return NULL.
@@ -2270,8 +2325,6 @@ fix_join_expr_mutator(Node *node, fix_join_expr_context *context)
 		/* If not supplied by input plans, evaluate the contained expr */
 		return fix_join_expr_mutator((Node *) phv->phexpr, context);
 	}
-	if (IsA(node, Param))
-		return fix_param_node(context->root, (Param *) node);
 	/* Try matching more complex expressions too, if tlists have any */
 	if (context->outer_itlist && context->outer_itlist->has_non_vars)
 	{
@@ -2289,6 +2342,9 @@ fix_join_expr_mutator(Node *node, fix_join_expr_context *context)
 		if (newvar)
 			return (Node *) newvar;
 	}
+	/* Special cases (apply only AFTER failing to match to lower tlist) */
+	if (IsA(node, Param))
+		return fix_param_node(context->root, (Param *) node);
 	fix_expr_common(context->root, node);
 	return expression_tree_mutator(node,
 								   fix_join_expr_mutator,
@@ -2376,6 +2432,16 @@ fix_upper_expr_mutator(Node *node, fix_upper_expr_context *context)
 		/* If not supplied by input plan, evaluate the contained expr */
 		return fix_upper_expr_mutator((Node *) phv->phexpr, context);
 	}
+	/* Try matching more complex expressions too, if tlist has any */
+	if (context->subplan_itlist->has_non_vars)
+	{
+		newvar = search_indexed_tlist_for_non_var((Expr *) node,
+												  context->subplan_itlist,
+												  context->newvarno);
+		if (newvar)
+			return (Node *) newvar;
+	}
+	/* Special cases (apply only AFTER failing to match to lower tlist) */
 	if (IsA(node, Param))
 		return fix_param_node(context->root, (Param *) node);
 	if (IsA(node, Aggref))
@@ -2399,15 +2465,6 @@ fix_upper_expr_mutator(Node *node, fix_upper_expr_context *context)
 			}
 		}
 		/* If no match, just fall through to process it normally */
-	}
-	/* Try matching more complex expressions too, if tlist has any */
-	if (context->subplan_itlist->has_non_vars)
-	{
-		newvar = search_indexed_tlist_for_non_var((Expr *) node,
-												  context->subplan_itlist,
-												  context->newvarno);
-		if (newvar)
-			return (Node *) newvar;
 	}
 	fix_expr_common(context->root, node);
 	return expression_tree_mutator(node,
@@ -2521,6 +2578,42 @@ record_plan_function_dependency(PlannerInfo *root, Oid funcid)
 }
 
 /*
+ * record_plan_type_dependency
+ *		Mark the current plan as depending on a particular type.
+ *
+ * This is exported so that eval_const_expressions can record a
+ * dependency on a domain that it's removed a CoerceToDomain node for.
+ *
+ * We don't currently need to record dependencies on domains that the
+ * plan contains CoerceToDomain nodes for, though that might change in
+ * future.  Hence, this isn't actually called in this module, though
+ * someday fix_expr_common might call it.
+ */
+void
+record_plan_type_dependency(PlannerInfo *root, Oid typid)
+{
+	/*
+	 * As in record_plan_function_dependency, ignore the possibility that
+	 * someone would change a built-in domain.
+	 */
+	if (typid >= (Oid) FirstBootstrapObjectId)
+	{
+		PlanInvalItem *inval_item = makeNode(PlanInvalItem);
+
+		/*
+		 * It would work to use any syscache on pg_type, but the easiest is
+		 * TYPEOID since we already have the type's OID at hand.  Note that
+		 * plancache.c knows we use TYPEOID.
+		 */
+		inval_item->cacheId = TYPEOID;
+		inval_item->hashValue = GetSysCacheHashValue1(TYPEOID,
+													  ObjectIdGetDatum(typid));
+
+		root->glob->invalItems = lappend(root->glob->invalItems, inval_item);
+	}
+}
+
+/*
  * extract_query_dependencies
  *		Given a rewritten, but not yet planned, query or queries
  *		(i.e. a Query node or list of Query nodes), extract dependencies
@@ -2529,6 +2622,13 @@ record_plan_function_dependency(PlannerInfo *root, Oid funcid)
  *
  * This is needed by plancache.c to handle invalidation of cached unplanned
  * queries.
+ *
+ * Note: this does not go through eval_const_expressions, and hence doesn't
+ * reflect its additions of inlined functions and elided CoerceToDomain nodes
+ * to the invalItems list.  This is obviously OK for functions, since we'll
+ * see them in the original query tree anyway.  For domains, it's OK because
+ * we don't care about domains unless they get elided.  That is, a plan might
+ * have domain dependencies that the query tree doesn't.
  */
 void
 extract_query_dependencies(Node *query,
@@ -2558,14 +2658,20 @@ extract_query_dependencies(Node *query,
 	*hasRowSecurity = glob.dependsOnRole;
 }
 
-static bool
+/*
+ * Tree walker for extract_query_dependencies.
+ *
+ * This is exported so that expression_planner_with_deps can call it on
+ * simple expressions (post-planning, not before planning, in that case).
+ * In that usage, glob.dependsOnRole isn't meaningful, but the relationOids
+ * and invalItems lists are added to as needed.
+ */
+bool
 extract_query_dependencies_walker(Node *node, PlannerInfo *context)
 {
 	if (node == NULL)
 		return false;
 	Assert(!IsA(node, PlaceHolderVar));
-	/* Extract function dependencies and check for regclass Consts */
-	fix_expr_common(context, node);
 	if (IsA(node, Query))
 	{
 		Query	   *query = (Query *) node;
@@ -2605,6 +2711,8 @@ extract_query_dependencies_walker(Node *node, PlannerInfo *context)
 		return query_tree_walker(query, extract_query_dependencies_walker,
 								 (void *) context, 0);
 	}
+	/* Extract function dependencies and check for regclass Consts */
+	fix_expr_common(context, node);
 	return expression_tree_walker(node, extract_query_dependencies_walker,
 								  (void *) context);
 }

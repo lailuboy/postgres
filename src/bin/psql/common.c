@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2017, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2019, PostgreSQL Global Development Group
  *
  * src/bin/psql/common.c
  */
@@ -44,7 +44,7 @@ static bool is_select_command(const char *query);
  * Returns output file pointer into *fout, and is-a-pipe flag into *is_pipe.
  * Caller is responsible for adjusting SIGPIPE state if it's a pipe.
  *
- * On error, reports suitable error message and returns FALSE.
+ * On error, reports suitable error message and returns false.
  */
 bool
 openQueryOutputFile(const char *fname, FILE **fout, bool *is_pipe)
@@ -266,7 +266,7 @@ NoticeProcessor(void *arg, const char *message)
  * database queries.  In most places, this is accomplished by checking
  * cancel_pressed during long-running loops.  However, that won't work when
  * blocked on user input (in readline() or fgets()).  In those places, we
- * set sigint_interrupt_enabled TRUE while blocked, instructing the signal
+ * set sigint_interrupt_enabled true while blocked, instructing the signal
  * catcher to longjmp through sigint_interrupt_jmp.  We assume readline and
  * fgets are coded to handle possible interruption.  (XXX currently this does
  * not work on win32, so control-C is less useful there)
@@ -799,19 +799,19 @@ PSQLexecWatch(const char *query, const printQueryOpt *opt)
 			break;
 
 		case PGRES_EMPTY_QUERY:
-			psql_error(_("\\watch cannot be used with an empty query\n"));
+			psql_error("\\watch cannot be used with an empty query\n");
 			PQclear(res);
 			return -1;
 
 		case PGRES_COPY_OUT:
 		case PGRES_COPY_IN:
 		case PGRES_COPY_BOTH:
-			psql_error(_("\\watch cannot be used with COPY\n"));
+			psql_error("\\watch cannot be used with COPY\n");
 			PQclear(res);
 			return -1;
 
 		default:
-			psql_error(_("unexpected result status for \\watch\n"));
+			psql_error("unexpected result status for \\watch\n");
 			PQclear(res);
 			return -1;
 	}
@@ -836,7 +836,8 @@ PrintNotifications(void)
 {
 	PGnotify   *notify;
 
-	while ((notify = PQnotifies(pset.db)))
+	PQconsumeInput(pset.db);
+	while ((notify = PQnotifies(pset.db)) != NULL)
 	{
 		/* for backward compatibility, only show payload if nonempty */
 		if (notify->extra[0])
@@ -847,6 +848,7 @@ PrintNotifications(void)
 					notify->relname, notify->be_pid);
 		fflush(pset.queryFout);
 		PQfreemem(notify);
+		PQconsumeInput(pset.db);
 	}
 }
 
@@ -1090,20 +1092,49 @@ ProcessResult(PGresult **results)
 			 * connection out of its COPY state, then call PQresultStatus()
 			 * once and report any error.
 			 *
-			 * If pset.copyStream is set, use that as data source/sink,
-			 * otherwise use queryFout or cur_cmd_source as appropriate.
+			 * For COPY OUT, direct the output to pset.copyStream if it's set,
+			 * otherwise to pset.gfname if it's set, otherwise to queryFout.
+			 * For COPY IN, use pset.copyStream as data source if it's set,
+			 * otherwise cur_cmd_source.
 			 */
-			FILE	   *copystream = pset.copyStream;
+			FILE	   *copystream;
 			PGresult   *copy_result;
 
 			SetCancelConn();
 			if (result_status == PGRES_COPY_OUT)
 			{
-				if (!copystream)
+				bool		need_close = false;
+				bool		is_pipe = false;
+
+				if (pset.copyStream)
+				{
+					/* invoked by \copy */
+					copystream = pset.copyStream;
+				}
+				else if (pset.gfname)
+				{
+					/* invoked by \g */
+					if (openQueryOutputFile(pset.gfname,
+											&copystream, &is_pipe))
+					{
+						need_close = true;
+						if (is_pipe)
+							disable_sigpipe_trap();
+					}
+					else
+						copystream = NULL;	/* discard COPY data entirely */
+				}
+				else
+				{
+					/* fall back to the generic query output stream */
 					copystream = pset.queryFout;
+				}
+
 				success = handleCopyOut(pset.db,
 										copystream,
-										&copy_result) && success;
+										&copy_result)
+					&& success
+					&& (copystream != NULL);
 
 				/*
 				 * Suppress status printing if the report would go to the same
@@ -1115,11 +1146,25 @@ ProcessResult(PGresult **results)
 					PQclear(copy_result);
 					copy_result = NULL;
 				}
+
+				if (need_close)
+				{
+					/* close \g argument file/pipe */
+					if (is_pipe)
+					{
+						pclose(copystream);
+						restore_sigpipe_trap();
+					}
+					else
+					{
+						fclose(copystream);
+					}
+				}
 			}
 			else
 			{
-				if (!copystream)
-					copystream = pset.cur_cmd_source;
+				/* COPY IN */
+				copystream = pset.copyStream ? pset.copyStream : pset.cur_cmd_source;
 				success = handleCopyIn(pset.db,
 									   copystream,
 									   PQbinaryTuples(*results),
@@ -2047,8 +2092,8 @@ command_no_begin(const char *query)
 
 	/*
 	 * Commands not allowed within transactions.  The statements checked for
-	 * here should be exactly those that call PreventTransactionChain() in the
-	 * backend.
+	 * here should be exactly those that call PreventInTransactionBlock() in
+	 * the backend.
 	 */
 	if (wordlen == 6 && pg_strncasecmp(query, "vacuum", 6) == 0)
 		return true;

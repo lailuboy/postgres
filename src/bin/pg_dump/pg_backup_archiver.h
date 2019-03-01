@@ -92,10 +92,17 @@ typedef z_stream *z_streamp;
 													 * indicator */
 #define K_VERS_1_12 MAKE_ARCHIVE_VERSION(1, 12, 0)	/* add separate BLOB
 													 * entries */
+#define K_VERS_1_13 MAKE_ARCHIVE_VERSION(1, 13, 0)	/* change search_path
+													 * behavior */
 
-/* Current archive version number (the format we can output) */
+/*
+ * Current archive version number (the format we can output)
+ *
+ * Note: If you update the current archive version, consider
+ * https://postgr.es/m/20190227123217.GA27552@alvherre.pgsql
+ */
 #define K_VERS_MAJOR 1
-#define K_VERS_MINOR 12
+#define K_VERS_MINOR 13
 #define K_VERS_REV 0
 #define K_VERS_SELF MAKE_ARCHIVE_VERSION(K_VERS_MAJOR, K_VERS_MINOR, K_VERS_REV);
 
@@ -160,12 +167,12 @@ typedef int (*WriteBytePtrType) (ArchiveHandle *AH, const int i);
 typedef int (*ReadBytePtrType) (ArchiveHandle *AH);
 typedef void (*WriteBufPtrType) (ArchiveHandle *AH, const void *c, size_t len);
 typedef void (*ReadBufPtrType) (ArchiveHandle *AH, void *buf, size_t len);
-typedef void (*SaveArchivePtrType) (ArchiveHandle *AH);
 typedef void (*WriteExtraTocPtrType) (ArchiveHandle *AH, TocEntry *te);
 typedef void (*ReadExtraTocPtrType) (ArchiveHandle *AH, TocEntry *te);
 typedef void (*PrintExtraTocPtrType) (ArchiveHandle *AH, TocEntry *te);
 typedef void (*PrintTocDataPtrType) (ArchiveHandle *AH, TocEntry *te);
 
+typedef void (*PrepParallelRestorePtrType) (ArchiveHandle *AH);
 typedef void (*ClonePtrType) (ArchiveHandle *AH);
 typedef void (*DeClonePtrType) (ArchiveHandle *AH);
 
@@ -295,6 +302,7 @@ struct _archiveHandle
 	WorkerJobDumpPtrType WorkerJobDumpPtr;
 	WorkerJobRestorePtrType WorkerJobRestorePtr;
 
+	PrepParallelRestorePtrType PrepParallelRestorePtr;
 	ClonePtrType ClonePtr;		/* Clone format-specific fields */
 	DeClonePtrType DeClonePtr;	/* Clean up cloned fields */
 
@@ -344,7 +352,6 @@ struct _archiveHandle
 	char	   *currUser;		/* current username, or NULL if unknown */
 	char	   *currSchema;		/* current schema, or NULL */
 	char	   *currTablespace; /* current tablespace, or NULL */
-	bool		currWithOids;	/* current default_with_oids setting */
 
 	void	   *lo_buf;
 	size_t		lo_buf_used;
@@ -372,7 +379,6 @@ struct _tocEntry
 	char	   *tablespace;		/* null if not in a tablespace; empty string
 								 * means use database default */
 	char	   *owner;
-	bool		withOids;		/* Used only by "TABLE" tags */
 	char	   *desc;
 	char	   *defn;
 	char	   *dropStmt;
@@ -385,12 +391,13 @@ struct _tocEntry
 	void	   *formatData;		/* TOC Entry data specific to file format */
 
 	/* working state while dumping/restoring */
+	pgoff_t		dataLength;		/* item's data size; 0 if none or unknown */
 	teReqs		reqs;			/* do we need schema and/or data of object */
 	bool		created;		/* set for DATA member if TABLE was created */
 
 	/* working state (needed only for parallel restore) */
-	struct _tocEntry *par_prev; /* list links for pending/ready items; */
-	struct _tocEntry *par_next; /* these are NULL if not in either list */
+	struct _tocEntry *pending_prev; /* list links for pending-items list; */
+	struct _tocEntry *pending_next; /* NULL if not in that list */
 	int			depCount;		/* number of dependencies not yet restored */
 	DumpId	   *revDeps;		/* dumpIds of objects depending on this one */
 	int			nRevDeps;		/* number of such dependencies */
@@ -402,6 +409,28 @@ extern int	parallel_restore(ArchiveHandle *AH, TocEntry *te);
 extern void on_exit_close_archive(Archive *AHX);
 
 extern void warn_or_exit_horribly(ArchiveHandle *AH, const char *modulename, const char *fmt,...) pg_attribute_printf(3, 4);
+
+/* Options for ArchiveEntry */
+typedef struct _archiveOpts
+{
+	const char *tag;
+	const char *namespace;
+	const char *tablespace;
+	const char *owner;
+	const char *description;
+	teSection	section;
+	const char *createStmt;
+	const char *dropStmt;
+	const char *copyStmt;
+	const DumpId *deps;
+	int			nDeps;
+	DataDumperPtr dumpFn;
+	void	   *dumpArg;
+} ArchiveOpts;
+#define ARCHIVE_OPTS(...) &(ArchiveOpts){__VA_ARGS__}
+/* Called to add a TOC entry */
+extern TocEntry *ArchiveEntry(Archive *AHX, CatalogId catalogId,
+			 DumpId dumpId, ArchiveOpts *opts);
 
 extern void WriteTOC(ArchiveHandle *AH);
 extern void ReadTOC(ArchiveHandle *AH);
@@ -448,7 +477,7 @@ extern void InitArchiveFmt_Tar(ArchiveHandle *AH);
 
 extern bool isValidTarHeader(char *header);
 
-extern int	ReconnectToServer(ArchiveHandle *AH, const char *dbname, const char *newUser);
+extern void ReconnectToServer(ArchiveHandle *AH, const char *dbname, const char *newUser);
 extern void DropBlobIfExists(ArchiveHandle *AH, Oid oid);
 
 void		ahwrite(const void *ptr, size_t size, size_t nmemb, ArchiveHandle *AH);

@@ -97,6 +97,21 @@ SELECT relname, d.* FROM ONLY d, pg_class where d.tableoid = pg_class.oid;
 CREATE TEMP TABLE z (b TEXT, PRIMARY KEY(aa, b)) inherits (a);
 INSERT INTO z VALUES (NULL, 'text'); -- should fail
 
+-- Check inherited UPDATE with all children excluded
+create table some_tab (a int, b int);
+create table some_tab_child () inherits (some_tab);
+insert into some_tab_child values(1,2);
+
+explain (verbose, costs off)
+update some_tab set a = a + 1 where false;
+update some_tab set a = a + 1 where false;
+explain (verbose, costs off)
+update some_tab set a = a + 1 where false returning b, a;
+update some_tab set a = a + 1 where false returning b, a;
+table some_tab;
+
+drop table some_tab cascade;
+
 -- Check UPDATE with inherited target and an inherited source table
 create temp table foo(f1 int, f2 int);
 create temp table foo2(f3 int) inherits (foo);
@@ -190,32 +205,6 @@ insert into d values('test','one','two','three');
 alter table a alter column aa type integer using bit_length(aa);
 select * from d;
 
--- check that oid column is handled properly during alter table inherit
-create table oid_parent (a int) with oids;
-
-create table oid_child () inherits (oid_parent);
-select attinhcount, attislocal from pg_attribute
-  where attrelid = 'oid_child'::regclass and attname = 'oid';
-drop table oid_child;
-
-create table oid_child (a int) without oids;
-alter table oid_child inherit oid_parent;  -- fail
-alter table oid_child set with oids;
-select attinhcount, attislocal from pg_attribute
-  where attrelid = 'oid_child'::regclass and attname = 'oid';
-alter table oid_child inherit oid_parent;
-select attinhcount, attislocal from pg_attribute
-  where attrelid = 'oid_child'::regclass and attname = 'oid';
-alter table oid_child set without oids;  -- fail
-alter table oid_parent set without oids;
-select attinhcount, attislocal from pg_attribute
-  where attrelid = 'oid_child'::regclass and attname = 'oid';
-alter table oid_child set without oids;
-select attinhcount, attislocal from pg_attribute
-  where attrelid = 'oid_child'::regclass and attname = 'oid';
-
-drop table oid_parent cascade;
-
 -- Test non-inheritable parent constraints
 create table p1(ff1 int);
 alter table p1 add constraint p1chk check (ff1 > 0) no inherit;
@@ -237,9 +226,14 @@ drop table p1 cascade;
 -- tables. See the pgsql-hackers thread beginning Dec. 4/04
 create table base (i integer);
 create table derived () inherits (base);
+create table more_derived (like derived, b int) inherits (derived);
 insert into derived (i) values (0);
 select derived::base from derived;
 select NULL::derived::base;
+-- remove redundant conversions.
+explain (verbose on, costs off) select row(i, b)::more_derived::derived::base from more_derived;
+explain (verbose on, costs off) select (1, 2)::more_derived::derived::base;
+drop table more_derived;
 drop table derived;
 drop table base;
 
@@ -257,40 +251,40 @@ drop table p1;
 CREATE TABLE ac (aa TEXT);
 alter table ac add constraint ac_check check (aa is not null);
 CREATE TABLE bc (bb TEXT) INHERITS (ac);
-select pc.relname, pgc.conname, pgc.contype, pgc.conislocal, pgc.coninhcount, pgc.consrc from pg_class as pc inner join pg_constraint as pgc on (pgc.conrelid = pc.oid) where pc.relname in ('ac', 'bc') order by 1,2;
+select pc.relname, pgc.conname, pgc.contype, pgc.conislocal, pgc.coninhcount, pg_get_expr(pgc.conbin, pc.oid) as consrc from pg_class as pc inner join pg_constraint as pgc on (pgc.conrelid = pc.oid) where pc.relname in ('ac', 'bc') order by 1,2;
 
 insert into ac (aa) values (NULL);
 insert into bc (aa) values (NULL);
 
 alter table bc drop constraint ac_check;  -- fail, disallowed
 alter table ac drop constraint ac_check;
-select pc.relname, pgc.conname, pgc.contype, pgc.conislocal, pgc.coninhcount, pgc.consrc from pg_class as pc inner join pg_constraint as pgc on (pgc.conrelid = pc.oid) where pc.relname in ('ac', 'bc') order by 1,2;
+select pc.relname, pgc.conname, pgc.contype, pgc.conislocal, pgc.coninhcount, pg_get_expr(pgc.conbin, pc.oid) as consrc from pg_class as pc inner join pg_constraint as pgc on (pgc.conrelid = pc.oid) where pc.relname in ('ac', 'bc') order by 1,2;
 
 -- try the unnamed-constraint case
 alter table ac add check (aa is not null);
-select pc.relname, pgc.conname, pgc.contype, pgc.conislocal, pgc.coninhcount, pgc.consrc from pg_class as pc inner join pg_constraint as pgc on (pgc.conrelid = pc.oid) where pc.relname in ('ac', 'bc') order by 1,2;
+select pc.relname, pgc.conname, pgc.contype, pgc.conislocal, pgc.coninhcount, pg_get_expr(pgc.conbin, pc.oid) as consrc from pg_class as pc inner join pg_constraint as pgc on (pgc.conrelid = pc.oid) where pc.relname in ('ac', 'bc') order by 1,2;
 
 insert into ac (aa) values (NULL);
 insert into bc (aa) values (NULL);
 
 alter table bc drop constraint ac_aa_check;  -- fail, disallowed
 alter table ac drop constraint ac_aa_check;
-select pc.relname, pgc.conname, pgc.contype, pgc.conislocal, pgc.coninhcount, pgc.consrc from pg_class as pc inner join pg_constraint as pgc on (pgc.conrelid = pc.oid) where pc.relname in ('ac', 'bc') order by 1,2;
+select pc.relname, pgc.conname, pgc.contype, pgc.conislocal, pgc.coninhcount, pg_get_expr(pgc.conbin, pc.oid) as consrc from pg_class as pc inner join pg_constraint as pgc on (pgc.conrelid = pc.oid) where pc.relname in ('ac', 'bc') order by 1,2;
 
 alter table ac add constraint ac_check check (aa is not null);
 alter table bc no inherit ac;
-select pc.relname, pgc.conname, pgc.contype, pgc.conislocal, pgc.coninhcount, pgc.consrc from pg_class as pc inner join pg_constraint as pgc on (pgc.conrelid = pc.oid) where pc.relname in ('ac', 'bc') order by 1,2;
+select pc.relname, pgc.conname, pgc.contype, pgc.conislocal, pgc.coninhcount, pg_get_expr(pgc.conbin, pc.oid) as consrc from pg_class as pc inner join pg_constraint as pgc on (pgc.conrelid = pc.oid) where pc.relname in ('ac', 'bc') order by 1,2;
 alter table bc drop constraint ac_check;
-select pc.relname, pgc.conname, pgc.contype, pgc.conislocal, pgc.coninhcount, pgc.consrc from pg_class as pc inner join pg_constraint as pgc on (pgc.conrelid = pc.oid) where pc.relname in ('ac', 'bc') order by 1,2;
+select pc.relname, pgc.conname, pgc.contype, pgc.conislocal, pgc.coninhcount, pg_get_expr(pgc.conbin, pc.oid) as consrc from pg_class as pc inner join pg_constraint as pgc on (pgc.conrelid = pc.oid) where pc.relname in ('ac', 'bc') order by 1,2;
 alter table ac drop constraint ac_check;
-select pc.relname, pgc.conname, pgc.contype, pgc.conislocal, pgc.coninhcount, pgc.consrc from pg_class as pc inner join pg_constraint as pgc on (pgc.conrelid = pc.oid) where pc.relname in ('ac', 'bc') order by 1,2;
+select pc.relname, pgc.conname, pgc.contype, pgc.conislocal, pgc.coninhcount, pg_get_expr(pgc.conbin, pc.oid) as consrc from pg_class as pc inner join pg_constraint as pgc on (pgc.conrelid = pc.oid) where pc.relname in ('ac', 'bc') order by 1,2;
 
 drop table bc;
 drop table ac;
 
 create table ac (a int constraint check_a check (a <> 0));
 create table bc (a int constraint check_a check (a <> 0), b int constraint check_b check (b <> 0)) inherits (ac);
-select pc.relname, pgc.conname, pgc.contype, pgc.conislocal, pgc.coninhcount, pgc.consrc from pg_class as pc inner join pg_constraint as pgc on (pgc.conrelid = pc.oid) where pc.relname in ('ac', 'bc') order by 1,2;
+select pc.relname, pgc.conname, pgc.contype, pgc.conislocal, pgc.coninhcount, pg_get_expr(pgc.conbin, pc.oid) as consrc from pg_class as pc inner join pg_constraint as pgc on (pgc.conrelid = pc.oid) where pc.relname in ('ac', 'bc') order by 1,2;
 
 drop table bc;
 drop table ac;
@@ -298,10 +292,10 @@ drop table ac;
 create table ac (a int constraint check_a check (a <> 0));
 create table bc (b int constraint check_b check (b <> 0));
 create table cc (c int constraint check_c check (c <> 0)) inherits (ac, bc);
-select pc.relname, pgc.conname, pgc.contype, pgc.conislocal, pgc.coninhcount, pgc.consrc from pg_class as pc inner join pg_constraint as pgc on (pgc.conrelid = pc.oid) where pc.relname in ('ac', 'bc', 'cc') order by 1,2;
+select pc.relname, pgc.conname, pgc.contype, pgc.conislocal, pgc.coninhcount, pg_get_expr(pgc.conbin, pc.oid) as consrc from pg_class as pc inner join pg_constraint as pgc on (pgc.conrelid = pc.oid) where pc.relname in ('ac', 'bc', 'cc') order by 1,2;
 
 alter table cc no inherit bc;
-select pc.relname, pgc.conname, pgc.contype, pgc.conislocal, pgc.coninhcount, pgc.consrc from pg_class as pc inner join pg_constraint as pgc on (pgc.conrelid = pc.oid) where pc.relname in ('ac', 'bc', 'cc') order by 1,2;
+select pc.relname, pgc.conname, pgc.contype, pgc.conislocal, pgc.coninhcount, pg_get_expr(pgc.conbin, pc.oid) as consrc from pg_class as pc inner join pg_constraint as pgc on (pgc.conrelid = pc.oid) where pc.relname in ('ac', 'bc', 'cc') order by 1,2;
 
 drop table cc;
 drop table bc;
@@ -409,6 +403,18 @@ DROP TABLE test_foreign_constraints_inh;
 DROP TABLE test_foreign_constraints;
 DROP TABLE test_primary_constraints;
 
+-- Test foreign key behavior
+create table inh_fk_1 (a int primary key);
+insert into inh_fk_1 values (1), (2), (3);
+create table inh_fk_2 (x int primary key, y int references inh_fk_1 on delete cascade);
+insert into inh_fk_2 values (11, 1), (22, 2), (33, 3);
+create table inh_fk_2_child () inherits (inh_fk_2);
+insert into inh_fk_2_child values (111, 1), (222, 2);
+delete from inh_fk_1 where a = 1;
+select * from inh_fk_1 order by 1;
+select * from inh_fk_2 order by 1, 2;
+drop table inh_fk_1, inh_fk_2, inh_fk_2_child;
+
 -- Test that parent and child CHECK constraints can be created in either order
 create table p1(f1 int);
 create table p1_c1() inherits(p1);
@@ -508,11 +514,13 @@ select min(1-id) from matest0;
 reset enable_indexscan;
 
 set enable_seqscan = off;  -- plan with fewest seqscans should be merge
+set enable_parallel_append = off; -- Don't let parallel-append interfere
 explain (verbose, costs off) select * from matest0 order by 1-id;
 select * from matest0 order by 1-id;
 explain (verbose, costs off) select min(1-id) from matest0;
 select min(1-id) from matest0;
 reset enable_seqscan;
+reset enable_parallel_append;
 
 drop table matest0 cascade;
 
@@ -610,6 +618,35 @@ reset enable_indexscan;
 reset enable_bitmapscan;
 
 --
+-- Check handling of a constant-null CHECK constraint
+--
+create table cnullparent (f1 int);
+create table cnullchild (check (f1 = 1 or f1 = null)) inherits(cnullparent);
+insert into cnullchild values(1);
+insert into cnullchild values(2);
+insert into cnullchild values(null);
+select * from cnullparent;
+select * from cnullparent where f1 = 2;
+drop table cnullparent cascade;
+
+--
+-- Check use of temporary tables with inheritance trees
+--
+create table inh_perm_parent (a1 int);
+create temp table inh_temp_parent (a1 int);
+create temp table inh_temp_child () inherits (inh_perm_parent); -- ok
+create table inh_perm_child () inherits (inh_temp_parent); -- error
+create temp table inh_temp_child_2 () inherits (inh_temp_parent); -- ok
+insert into inh_perm_parent values (1);
+insert into inh_temp_parent values (2);
+insert into inh_temp_child values (3);
+insert into inh_temp_child_2 values (4);
+select tableoid::regclass, a1 from inh_perm_parent;
+select tableoid::regclass, a1 from inh_temp_parent;
+drop table inh_perm_parent cascade;
+drop table inh_temp_parent cascade;
+
+--
 -- Check that constraint exclusion works correctly with partitions using
 -- implicit constraints generated from the partition bound information.
 --
@@ -664,19 +701,20 @@ drop table range_list_parted;
 -- check that constraint exclusion is able to cope with the partition
 -- constraint emitted for multi-column range partitioned tables
 create table mcrparted (a int, b int, c int) partition by range (a, abs(b), c);
+create table mcrparted_def partition of mcrparted default;
 create table mcrparted0 partition of mcrparted for values from (minvalue, minvalue, minvalue) to (1, 1, 1);
 create table mcrparted1 partition of mcrparted for values from (1, 1, 1) to (10, 5, 10);
 create table mcrparted2 partition of mcrparted for values from (10, 5, 10) to (10, 10, 10);
 create table mcrparted3 partition of mcrparted for values from (11, 1, 1) to (20, 10, 10);
 create table mcrparted4 partition of mcrparted for values from (20, 10, 10) to (20, 20, 20);
 create table mcrparted5 partition of mcrparted for values from (20, 20, 20) to (maxvalue, maxvalue, maxvalue);
-explain (costs off) select * from mcrparted where a = 0;	-- scans mcrparted0
-explain (costs off) select * from mcrparted where a = 10 and abs(b) < 5;	-- scans mcrparted1
-explain (costs off) select * from mcrparted where a = 10 and abs(b) = 5;	-- scans mcrparted1, mcrparted2
+explain (costs off) select * from mcrparted where a = 0;	-- scans mcrparted0, mcrparted_def
+explain (costs off) select * from mcrparted where a = 10 and abs(b) < 5;	-- scans mcrparted1, mcrparted_def
+explain (costs off) select * from mcrparted where a = 10 and abs(b) = 5;	-- scans mcrparted1, mcrparted2, mcrparted_def
 explain (costs off) select * from mcrparted where abs(b) = 5;	-- scans all partitions
 explain (costs off) select * from mcrparted where a > -1;	-- scans all partitions
 explain (costs off) select * from mcrparted where a = 20 and abs(b) = 10 and c > 10;	-- scans mcrparted4
-explain (costs off) select * from mcrparted where a = 20 and c > 20; -- scans mcrparted3, mcrparte4, mcrparte5
+explain (costs off) select * from mcrparted where a = 20 and c > 20; -- scans mcrparted3, mcrparte4, mcrparte5, mcrparted_def
 drop table mcrparted;
 
 -- check that partitioned table Appends cope with being referenced in

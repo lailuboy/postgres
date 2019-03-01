@@ -23,7 +23,7 @@
  * for aborts (whether sync or async), since the post-crash assumption would
  * be that such transactions failed anyway.
  *
- * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/clog.c
@@ -241,21 +241,27 @@ set_status_by_pages(int nsubxids, TransactionId *subxids,
 	int			offset = 0;
 	int			i = 0;
 
+	Assert(nsubxids > 0);		/* else the pageno fetch above is unsafe */
+
 	while (i < nsubxids)
 	{
 		int			num_on_page = 0;
+		int			nextpageno;
 
-		while (TransactionIdToPage(subxids[i]) == pageno && i < nsubxids)
+		do
 		{
+			nextpageno = TransactionIdToPage(subxids[i]);
+			if (nextpageno != pageno)
+				break;
 			num_on_page++;
 			i++;
-		}
+		} while (i < nsubxids);
 
 		TransactionIdSetPageStatus(InvalidTransactionId,
 								   num_on_page, subxids + offset,
 								   status, lsn, pageno, false);
 		offset = i;
-		pageno = TransactionIdToPage(subxids[offset]);
+		pageno = nextpageno;
 	}
 }
 
@@ -721,7 +727,7 @@ BootStrapCLOG(void)
 
 /*
  * Initialize (or reinitialize) a page of CLOG to zeroes.
- * If writeXlog is TRUE, also emit an XLOG record saying we did this.
+ * If writeXlog is true, also emit an XLOG record saying we did this.
  *
  * The page is not actually written, just set up in shared memory.
  * The slot number of the new page is returned.

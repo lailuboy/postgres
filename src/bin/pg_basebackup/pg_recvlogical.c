@@ -3,7 +3,7 @@
  * pg_recvlogical.c - receive data from a logical decoding slot in a streaming
  *					  fashion and write it to a local file.
  *
- * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/bin/pg_basebackup/pg_recvlogical.c
@@ -23,6 +23,7 @@
 #include "streamutil.h"
 
 #include "access/xlog_internal.h"
+#include "common/file_perm.h"
 #include "common/fe_memutils.h"
 #include "getopt_long.h"
 #include "libpq-fe.h"
@@ -64,7 +65,6 @@ static XLogRecPtr output_fsync_lsn = InvalidXLogRecPtr;
 
 static void usage(void);
 static void StreamLogicalLog(void);
-static void disconnect_and_exit(int code);
 static bool flushAndSendFeedback(PGconn *conn, TimestampTz *now);
 static void prepareToTerminate(PGconn *conn, XLogRecPtr endpos,
 				   bool keepalive, XLogRecPtr lsn);
@@ -105,7 +105,7 @@ usage(void)
 	printf(_("  -U, --username=NAME    connect as specified database user\n"));
 	printf(_("  -w, --no-password      never prompt for password\n"));
 	printf(_("  -W, --password         force password prompt (should happen automatically)\n"));
-	printf(_("\nReport bugs to <pgsql-bugs@postgresql.org>.\n"));
+	printf(_("\nReport bugs to <pgsql-bugs@lists.postgresql.org>.\n"));
 }
 
 /*
@@ -121,7 +121,7 @@ sendFeedback(PGconn *conn, TimestampTz now, bool force, bool replyRequested)
 	int			len = 0;
 
 	/*
-	 * we normally don't want to send superfluous feedbacks, but if it's
+	 * we normally don't want to send superfluous feedback, but if it's
 	 * because of a timeout we need to, otherwise wal_sender_timeout will kill
 	 * us.
 	 */
@@ -166,12 +166,10 @@ sendFeedback(PGconn *conn, TimestampTz now, bool force, bool replyRequested)
 }
 
 static void
-disconnect_and_exit(int code)
+disconnect_atexit(void)
 {
 	if (conn != NULL)
 		PQfinish(conn);
-
-	exit(code);
 }
 
 static bool
@@ -196,7 +194,7 @@ OutputFsync(TimestampTz now)
 	if (fsync(outfd) != 0)
 	{
 		fprintf(stderr,
-				_("%s: could not fsync log file \"%s\": %s\n"),
+				_("%s: could not fsync file \"%s\": %s\n"),
 				progname, outfile, strerror(errno));
 		return false;
 	}
@@ -943,21 +941,32 @@ main(int argc, char **argv)
 	if (!conn)
 		/* Error message already written in GetConnection() */
 		exit(1);
+	atexit(disconnect_atexit);
 
 	/*
 	 * Run IDENTIFY_SYSTEM to make sure we connected using a database specific
 	 * replication connection.
 	 */
 	if (!RunIdentifySystem(conn, NULL, NULL, NULL, &db_name))
-		disconnect_and_exit(1);
+		exit(1);
 
 	if (db_name == NULL)
 	{
 		fprintf(stderr,
 				_("%s: could not establish database-specific replication connection\n"),
 				progname);
-		disconnect_and_exit(1);
+		exit(1);
 	}
+
+	/*
+	 * Set umask so that directories/files are created with the same
+	 * permissions as directories/files in the source data directory.
+	 *
+	 * pg_mode_mask is set to owner-only by default and then updated in
+	 * GetConnection() where we get the mode from the server-side with
+	 * RetrieveDataDirCreatePerm() and then call SetDataDirectoryCreatePerm().
+	 */
+	umask(pg_mode_mask);
 
 	/* Drop a replication slot. */
 	if (do_drop_slot)
@@ -968,7 +977,7 @@ main(int argc, char **argv)
 					progname, replication_slot);
 
 		if (!DropReplicationSlot(conn, replication_slot))
-			disconnect_and_exit(1);
+			exit(1);
 	}
 
 	/* Create a replication slot. */
@@ -979,14 +988,14 @@ main(int argc, char **argv)
 					_("%s: creating replication slot \"%s\"\n"),
 					progname, replication_slot);
 
-		if (!CreateReplicationSlot(conn, replication_slot, plugin,
-								   false, slot_exists_ok))
-			disconnect_and_exit(1);
+		if (!CreateReplicationSlot(conn, replication_slot, plugin, false,
+								   false, false, slot_exists_ok))
+			exit(1);
 		startpos = InvalidXLogRecPtr;
 	}
 
 	if (!do_start_slot)
-		disconnect_and_exit(0);
+		exit(0);
 
 	/* Stream loop */
 	while (true)
@@ -998,7 +1007,7 @@ main(int argc, char **argv)
 			 * We've been Ctrl-C'ed or reached an exit limit condition. That's
 			 * not an error, so exit without an errorcode.
 			 */
-			disconnect_and_exit(0);
+			exit(0);
 		}
 		else if (noloop)
 		{
@@ -1037,7 +1046,7 @@ flushAndSendFeedback(PGconn *conn, TimestampTz *now)
 }
 
 /*
- * Try to inform the server about of upcoming demise, but don't wait around or
+ * Try to inform the server about our upcoming demise, but don't wait around or
  * retry on failure.
  */
 static void

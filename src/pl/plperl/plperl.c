@@ -21,7 +21,6 @@
 #include "access/xact.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_proc.h"
-#include "catalog/pg_proc_fn.h"
 #include "catalog/pg_type.h"
 #include "commands/event_trigger.h"
 #include "commands/trigger.h"
@@ -179,8 +178,11 @@ typedef struct plperl_call_data
 {
 	plperl_proc_desc *prodesc;
 	FunctionCallInfo fcinfo;
+	/* remaining fields are used only in a function returning set: */
 	Tuplestorestate *tuple_store;
 	TupleDesc	ret_tdesc;
+	Oid			cdomain_oid;	/* 0 unless returning domain-over-composite */
+	void	   *cdomain_info;
 	MemoryContext tmp_cxt;
 } plperl_call_data;
 
@@ -290,7 +292,7 @@ static void plperl_return_next_internal(SV *sv);
 static char *hek2cstr(HE *he);
 static SV **hv_store_string(HV *hv, const char *key, SV *val);
 static SV **hv_fetch_string(HV *hv, const char *key);
-static void plperl_create_sub(plperl_proc_desc *desc, char *s, Oid fn_oid);
+static void plperl_create_sub(plperl_proc_desc *desc, const char *s, Oid fn_oid);
 static SV  *plperl_call_perl_func(plperl_proc_desc *desc,
 					  FunctionCallInfo fcinfo);
 static void plperl_compile_callback(void *arg);
@@ -1356,6 +1358,7 @@ plperl_sv_to_datum(SV *sv, Oid typid, int32 typmod,
 			/* handle a hashref */
 			Datum		ret;
 			TupleDesc	td;
+			bool		isdomain;
 
 			if (!type_is_rowtype(typid))
 				ereport(ERROR,
@@ -1363,19 +1366,35 @@ plperl_sv_to_datum(SV *sv, Oid typid, int32 typmod,
 						 errmsg("cannot convert Perl hash to non-composite type %s",
 								format_type_be(typid))));
 
-			td = lookup_rowtype_tupdesc_noerror(typid, typmod, true);
-			if (td == NULL)
+			td = lookup_rowtype_tupdesc_domain(typid, typmod, true);
+			if (td != NULL)
 			{
-				/* Try to look it up based on our result type */
-				if (fcinfo == NULL ||
-					get_call_result_type(fcinfo, NULL, &td) != TYPEFUNC_COMPOSITE)
+				/* Did we look through a domain? */
+				isdomain = (typid != td->tdtypeid);
+			}
+			else
+			{
+				/* Must be RECORD, try to resolve based on call info */
+				TypeFuncClass funcclass;
+
+				if (fcinfo)
+					funcclass = get_call_result_type(fcinfo, &typid, &td);
+				else
+					funcclass = TYPEFUNC_OTHER;
+				if (funcclass != TYPEFUNC_COMPOSITE &&
+					funcclass != TYPEFUNC_COMPOSITE_DOMAIN)
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("function returning record called in context "
 									"that cannot accept type record")));
+				Assert(td);
+				isdomain = (funcclass == TYPEFUNC_COMPOSITE_DOMAIN);
 			}
 
 			ret = plperl_hash_to_datum(sv, td);
+
+			if (isdomain)
+				domain_check(ret, false, typid, NULL, NULL);
 
 			/* Release on the result of get_call_result_type is harmless */
 			ReleaseTupleDesc(td);
@@ -1383,11 +1402,13 @@ plperl_sv_to_datum(SV *sv, Oid typid, int32 typmod,
 			return ret;
 		}
 
-		/* Reference, but not reference to hash or array ... */
-		ereport(ERROR,
-				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("PL/Perl function must return reference to hash or array")));
-		return (Datum) 0;		/* shut up compiler */
+		/*
+		 * If it's a reference to something else, such as a scalar, just
+		 * recursively look through the reference.
+		 */
+		return plperl_sv_to_datum(SvRV(sv), typid, typmod,
+								  fcinfo, finfo, typioparam,
+								  isnull);
 	}
 	else
 	{
@@ -1855,8 +1876,8 @@ PG_FUNCTION_INFO_V1(plperl_inline_handler);
 Datum
 plperl_inline_handler(PG_FUNCTION_ARGS)
 {
+	LOCAL_FCINFO(fake_fcinfo, 0);
 	InlineCodeBlock *codeblock = (InlineCodeBlock *) PG_GETARG_POINTER(0);
-	FunctionCallInfoData fake_fcinfo;
 	FmgrInfo	flinfo;
 	plperl_proc_desc desc;
 	plperl_call_data *volatile save_call_data = current_call_data;
@@ -1878,10 +1899,10 @@ plperl_inline_handler(PG_FUNCTION_ARGS)
 	 * plperl_call_perl_func().  In particular note that this sets things up
 	 * with no arguments passed, and a result type of VOID.
 	 */
-	MemSet(&fake_fcinfo, 0, sizeof(fake_fcinfo));
+	MemSet(fake_fcinfo, 0, SizeForFunctionCallInfo(0));
 	MemSet(&flinfo, 0, sizeof(flinfo));
 	MemSet(&desc, 0, sizeof(desc));
-	fake_fcinfo.flinfo = &flinfo;
+	fake_fcinfo->flinfo = &flinfo;
 	flinfo.fn_oid = InvalidOid;
 	flinfo.fn_mcxt = CurrentMemoryContext;
 
@@ -1895,11 +1916,11 @@ plperl_inline_handler(PG_FUNCTION_ARGS)
 	desc.fn_retistuple = false;
 	desc.fn_retisset = false;
 	desc.fn_retisarray = false;
-	desc.result_oid = VOIDOID;
+	desc.result_oid = InvalidOid;
 	desc.nargs = 0;
 	desc.reference = NULL;
 
-	this_call_data.fcinfo = &fake_fcinfo;
+	this_call_data.fcinfo = fake_fcinfo;
 	this_call_data.prodesc = &desc;
 	/* we do not bother with refcounting the fake prodesc */
 
@@ -1909,7 +1930,7 @@ plperl_inline_handler(PG_FUNCTION_ARGS)
 
 		current_call_data = &this_call_data;
 
-		if (SPI_connect() != SPI_OK_CONNECT)
+		if (SPI_connect_ext(codeblock->atomic ? 0 : SPI_OPT_NONATOMIC) != SPI_OK_CONNECT)
 			elog(ERROR, "could not connect to SPI manager");
 
 		select_perl_context(desc.lanpltrusted);
@@ -1919,7 +1940,7 @@ plperl_inline_handler(PG_FUNCTION_ARGS)
 		if (!desc.reference)	/* can this happen? */
 			elog(ERROR, "could not create internal procedure for anonymous code block");
 
-		perlret = plperl_call_perl_func(&desc, &fake_fcinfo);
+		perlret = plperl_call_perl_func(&desc, fake_fcinfo);
 
 		SvREFCNT_dec_current(perlret);
 
@@ -2063,7 +2084,7 @@ plperlu_validator(PG_FUNCTION_ARGS)
  * supplied in s, and returns a reference to it
  */
 static void
-plperl_create_sub(plperl_proc_desc *prodesc, char *s, Oid fn_oid)
+plperl_create_sub(plperl_proc_desc *prodesc, const char *s, Oid fn_oid)
 {
 	dTHX;
 	dSP;
@@ -2173,11 +2194,11 @@ plperl_call_perl_func(plperl_proc_desc *desc, FunctionCallInfo fcinfo)
 
 	for (i = 0; i < desc->nargs; i++)
 	{
-		if (fcinfo->argnull[i])
+		if (fcinfo->args[i].isnull)
 			PUSHs(&PL_sv_undef);
 		else if (desc->arg_is_rowtype[i])
 		{
-			SV		   *sv = plperl_hash_from_datum(fcinfo->arg[i]);
+			SV		   *sv = plperl_hash_from_datum(fcinfo->args[i].value);
 
 			PUSHs(sv_2mortal(sv));
 		}
@@ -2187,15 +2208,15 @@ plperl_call_perl_func(plperl_proc_desc *desc, FunctionCallInfo fcinfo)
 			Oid			funcid;
 
 			if (OidIsValid(desc->arg_arraytype[i]))
-				sv = plperl_ref_from_pg_array(fcinfo->arg[i], desc->arg_arraytype[i]);
+				sv = plperl_ref_from_pg_array(fcinfo->args[i].value, desc->arg_arraytype[i]);
 			else if ((funcid = get_transform_fromsql(argtypes[i], current_call_data->prodesc->lang_oid, current_call_data->prodesc->trftypes)))
-				sv = (SV *) DatumGetPointer(OidFunctionCall1(funcid, fcinfo->arg[i]));
+				sv = (SV *) DatumGetPointer(OidFunctionCall1(funcid, fcinfo->args[i].value));
 			else
 			{
 				char	   *tmp;
 
 				tmp = OutputFunctionCall(&(desc->arg_out_func[i]),
-										 fcinfo->arg[i]);
+										 fcinfo->args[i].value);
 				sv = cstr2sv(tmp);
 				pfree(tmp);
 			}
@@ -2376,13 +2397,18 @@ plperl_call_perl_event_trigger_func(plperl_proc_desc *desc,
 static Datum
 plperl_func_handler(PG_FUNCTION_ARGS)
 {
+	bool		nonatomic;
 	plperl_proc_desc *prodesc;
 	SV		   *perlret;
 	Datum		retval = 0;
 	ReturnSetInfo *rsi;
 	ErrorContextCallback pl_error_context;
 
-	if (SPI_connect() != SPI_OK_CONNECT)
+	nonatomic = fcinfo->context &&
+		IsA(fcinfo->context, CallContext) &&
+		!castNode(CallContext, fcinfo->context)->atomic;
+
+	if (SPI_connect_ext(nonatomic ? SPI_OPT_NONATOMIC : 0) != SPI_OK_CONNECT)
 		elog(ERROR, "could not connect to SPI manager");
 
 	prodesc = compile_plperl_function(fcinfo->flinfo->fn_oid, false, false);
@@ -2401,8 +2427,7 @@ plperl_func_handler(PG_FUNCTION_ARGS)
 	{
 		/* Check context before allowing the call to go through */
 		if (!rsi || !IsA(rsi, ReturnSetInfo) ||
-			(rsi->allowedModes & SFRM_Materialize) == 0 ||
-			rsi->expectedDesc == NULL)
+			(rsi->allowedModes & SFRM_Materialize) == 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("set-valued function called in context that "
@@ -2462,7 +2487,7 @@ plperl_func_handler(PG_FUNCTION_ARGS)
 		}
 		retval = (Datum) 0;
 	}
-	else
+	else if (prodesc->result_oid)
 	{
 		retval = plperl_sv_to_datum(perlret,
 									prodesc->result_oid,
@@ -2759,7 +2784,7 @@ compile_plperl_function(Oid fn_oid, bool is_trigger, bool is_event_trigger)
 		 * Allocate a context that will hold all PG data for the procedure.
 		 ************************************************************/
 		proc_cxt = AllocSetContextCreate(TopMemoryContext,
-										 NameStr(procStruct->proname),
+										 "PL/Perl function",
 										 ALLOCSET_SMALL_SIZES);
 
 		/************************************************************
@@ -2769,6 +2794,7 @@ compile_plperl_function(Oid fn_oid, bool is_trigger, bool is_event_trigger)
 		oldcontext = MemoryContextSwitchTo(proc_cxt);
 		prodesc = (plperl_proc_desc *) palloc0(sizeof(plperl_proc_desc));
 		prodesc->proname = pstrdup(NameStr(procStruct->proname));
+		MemoryContextSetIdentifier(proc_cxt, prodesc->proname);
 		prodesc->fn_cxt = proc_cxt;
 		prodesc->fn_refcount = 0;
 		prodesc->fn_xmin = HeapTupleHeaderGetRawXmin(procTup->t_data);
@@ -2799,7 +2825,7 @@ compile_plperl_function(Oid fn_oid, bool is_trigger, bool is_event_trigger)
 			elog(ERROR, "cache lookup failed for language %u",
 				 procStruct->prolang);
 		langStruct = (Form_pg_language) GETSTRUCT(langTup);
-		prodesc->lang_oid = HeapTupleGetOid(langTup);
+		prodesc->lang_oid = langStruct->oid;
 		prodesc->lanpltrusted = langStruct->lanpltrusted;
 		ReleaseSysCache(langTup);
 
@@ -2809,22 +2835,21 @@ compile_plperl_function(Oid fn_oid, bool is_trigger, bool is_event_trigger)
 		 ************************************************************/
 		if (!is_trigger && !is_event_trigger)
 		{
-			typeTup =
-				SearchSysCache1(TYPEOID,
-								ObjectIdGetDatum(procStruct->prorettype));
+			Oid			rettype = procStruct->prorettype;
+
+			typeTup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(rettype));
 			if (!HeapTupleIsValid(typeTup))
-				elog(ERROR, "cache lookup failed for type %u",
-					 procStruct->prorettype);
+				elog(ERROR, "cache lookup failed for type %u", rettype);
 			typeStruct = (Form_pg_type) GETSTRUCT(typeTup);
 
 			/* Disallow pseudotype result, except VOID or RECORD */
 			if (typeStruct->typtype == TYPTYPE_PSEUDO)
 			{
-				if (procStruct->prorettype == VOIDOID ||
-					procStruct->prorettype == RECORDOID)
+				if (rettype == VOIDOID ||
+					rettype == RECORDOID)
 					 /* okay */ ;
-				else if (procStruct->prorettype == TRIGGEROID ||
-						 procStruct->prorettype == EVTTRIGGEROID)
+				else if (rettype == TRIGGEROID ||
+						 rettype == EVTTRIGGEROID)
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("trigger functions can only be called "
@@ -2833,13 +2858,12 @@ compile_plperl_function(Oid fn_oid, bool is_trigger, bool is_event_trigger)
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("PL/Perl functions cannot return type %s",
-									format_type_be(procStruct->prorettype))));
+									format_type_be(rettype))));
 			}
 
-			prodesc->result_oid = procStruct->prorettype;
+			prodesc->result_oid = rettype;
 			prodesc->fn_retisset = procStruct->proretset;
-			prodesc->fn_retistuple = (procStruct->prorettype == RECORDOID ||
-									  typeStruct->typtype == TYPTYPE_COMPOSITE);
+			prodesc->fn_retistuple = type_is_rowtype(rettype);
 
 			prodesc->fn_retisarray =
 				(typeStruct->typlen == -1 && typeStruct->typelem);
@@ -2862,23 +2886,22 @@ compile_plperl_function(Oid fn_oid, bool is_trigger, bool is_event_trigger)
 
 			for (i = 0; i < prodesc->nargs; i++)
 			{
-				typeTup = SearchSysCache1(TYPEOID,
-										  ObjectIdGetDatum(procStruct->proargtypes.values[i]));
+				Oid			argtype = procStruct->proargtypes.values[i];
+
+				typeTup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(argtype));
 				if (!HeapTupleIsValid(typeTup))
-					elog(ERROR, "cache lookup failed for type %u",
-						 procStruct->proargtypes.values[i]);
+					elog(ERROR, "cache lookup failed for type %u", argtype);
 				typeStruct = (Form_pg_type) GETSTRUCT(typeTup);
 
-				/* Disallow pseudotype argument */
+				/* Disallow pseudotype argument, except RECORD */
 				if (typeStruct->typtype == TYPTYPE_PSEUDO &&
-					procStruct->proargtypes.values[i] != RECORDOID)
+					argtype != RECORDOID)
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("PL/Perl functions cannot accept type %s",
-									format_type_be(procStruct->proargtypes.values[i]))));
+									format_type_be(argtype))));
 
-				if (typeStruct->typtype == TYPTYPE_COMPOSITE ||
-					procStruct->proargtypes.values[i] == RECORDOID)
+				if (type_is_rowtype(argtype))
 					prodesc->arg_is_rowtype[i] = true;
 				else
 				{
@@ -2888,9 +2911,9 @@ compile_plperl_function(Oid fn_oid, bool is_trigger, bool is_event_trigger)
 								  proc_cxt);
 				}
 
-				/* Identify array attributes */
+				/* Identify array-type arguments */
 				if (typeStruct->typelem != 0 && typeStruct->typlen == -1)
-					prodesc->arg_arraytype[i] = procStruct->proargtypes.values[i];
+					prodesc->arg_arraytype[i] = argtype;
 				else
 					prodesc->arg_arraytype[i] = InvalidOid;
 
@@ -3249,11 +3272,25 @@ plperl_return_next_internal(SV *sv)
 
 		/*
 		 * This is the first call to return_next in the current PL/Perl
-		 * function call, so identify the output tuple descriptor and create a
+		 * function call, so identify the output tuple type and create a
 		 * tuplestore to hold the result rows.
 		 */
 		if (prodesc->fn_retistuple)
-			(void) get_call_result_type(fcinfo, NULL, &tupdesc);
+		{
+			TypeFuncClass funcclass;
+			Oid			typid;
+
+			funcclass = get_call_result_type(fcinfo, &typid, &tupdesc);
+			if (funcclass != TYPEFUNC_COMPOSITE &&
+				funcclass != TYPEFUNC_COMPOSITE_DOMAIN)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("function returning record called in context "
+								"that cannot accept type record")));
+			/* if domain-over-composite, remember the domain's type OID */
+			if (funcclass == TYPEFUNC_COMPOSITE_DOMAIN)
+				current_call_data->cdomain_oid = typid;
+		}
 		else
 		{
 			tupdesc = rsi->expectedDesc;
@@ -3304,9 +3341,16 @@ plperl_return_next_internal(SV *sv)
 
 		tuple = plperl_build_tuple_result((HV *) SvRV(sv),
 										  current_call_data->ret_tdesc);
+
+		if (OidIsValid(current_call_data->cdomain_oid))
+			domain_check(HeapTupleGetDatum(tuple), false,
+						 current_call_data->cdomain_oid,
+						 &current_call_data->cdomain_info,
+						 rsi->econtext->ecxt_per_query_memory);
+
 		tuplestore_puttuple(current_call_data->tuple_store, tuple);
 	}
-	else
+	else if (prodesc->result_oid)
 	{
 		Datum		ret[1];
 		bool		isNull[1];
@@ -3367,6 +3411,8 @@ plperl_spi_query(char *query)
 			elog(ERROR, "SPI_cursor_open() failed:%s",
 				 SPI_result_code_string(SPI_result));
 		cursor = cstr2sv(portal->name);
+
+		PinPortal(portal);
 
 		/* Commit the inner transaction, return to outer xact context */
 		ReleaseCurrentSubTransaction();
@@ -3431,6 +3477,7 @@ plperl_spi_fetchrow(char *cursor)
 			SPI_cursor_fetch(p, true, 1);
 			if (SPI_processed == 0)
 			{
+				UnpinPortal(p);
 				SPI_cursor_close(p);
 				row = &PL_sv_undef;
 			}
@@ -3482,7 +3529,10 @@ plperl_spi_cursor_close(char *cursor)
 	p = SPI_cursor_find(cursor);
 
 	if (p)
+	{
+		UnpinPortal(p);
 		SPI_cursor_close(p);
+	}
 }
 
 SV *
@@ -3846,6 +3896,8 @@ plperl_spi_query_prepared(char *query, int argc, SV **argv)
 
 		cursor = cstr2sv(portal->name);
 
+		PinPortal(portal);
+
 		/* Commit the inner transaction, return to outer xact context */
 		ReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(oldcontext);
@@ -3905,6 +3957,60 @@ plperl_spi_freeplan(char *query)
 	MemoryContextDelete(qdesc->plan_cxt);
 
 	SPI_freeplan(plan);
+}
+
+void
+plperl_spi_commit(void)
+{
+	MemoryContext oldcontext = CurrentMemoryContext;
+
+	PG_TRY();
+	{
+		HoldPinnedPortals();
+
+		SPI_commit();
+		SPI_start_transaction();
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		/* Save error info */
+		MemoryContextSwitchTo(oldcontext);
+		edata = CopyErrorData();
+		FlushErrorState();
+
+		/* Punt the error to Perl */
+		croak_cstr(edata->message);
+	}
+	PG_END_TRY();
+}
+
+void
+plperl_spi_rollback(void)
+{
+	MemoryContext oldcontext = CurrentMemoryContext;
+
+	PG_TRY();
+	{
+		HoldPinnedPortals();
+
+		SPI_rollback();
+		SPI_start_transaction();
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		/* Save error info */
+		MemoryContextSwitchTo(oldcontext);
+		edata = CopyErrorData();
+		FlushErrorState();
+
+		/* Punt the error to Perl */
+		croak_cstr(edata->message);
+	}
+	PG_END_TRY();
 }
 
 /*

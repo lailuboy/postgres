@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2017, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2019, PostgreSQL Global Development Group
  *
  * src/bin/psql/startup.c
  */
@@ -101,7 +101,6 @@ main(int argc, char *argv[])
 	int			successResult;
 	bool		have_password = false;
 	char		password[100];
-	char	   *password_prompt = NULL;
 	bool		new_pass;
 
 	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("psql"));
@@ -144,6 +143,9 @@ main(int argc, char *argv[])
 	pset.popt.topt.start_table = true;
 	pset.popt.topt.stop_table = true;
 	pset.popt.topt.default_footer = true;
+
+	pset.popt.topt.csvFieldSep[0] = DEFAULT_CSV_FIELD_SEP;
+	pset.popt.topt.csvFieldSep[1] = '\0';
 
 	pset.popt.topt.unicode_border_linestyle = UNICODE_LINESTYLE_SINGLE;
 	pset.popt.topt.unicode_column_linestyle = UNICODE_LINESTYLE_SINGLE;
@@ -205,15 +207,14 @@ main(int argc, char *argv[])
 		pset.popt.topt.recordSep.separator_zero = false;
 	}
 
-	if (options.username == NULL)
-		password_prompt = pg_strdup(_("Password: "));
-	else
-		password_prompt = psprintf(_("Password for user %s: "),
-								   options.username);
-
 	if (pset.getPassword == TRI_YES)
 	{
-		simple_prompt(password_prompt, password, sizeof(password), false);
+		/*
+		 * We can't be sure yet of the username that will be used, so don't
+		 * offer a potentially wrong one.  Typical uses of this option are
+		 * noninteractive anyway.
+		 */
+		simple_prompt("Password: ", password, sizeof(password), false);
 		have_password = true;
 	}
 
@@ -252,14 +253,27 @@ main(int argc, char *argv[])
 			!have_password &&
 			pset.getPassword != TRI_NO)
 		{
+			/*
+			 * Before closing the old PGconn, extract the user name that was
+			 * actually connected with --- it might've come out of a URI or
+			 * connstring "database name" rather than options.username.
+			 */
+			const char *realusername = PQuser(pset.db);
+			char	   *password_prompt;
+
+			if (realusername && realusername[0])
+				password_prompt = psprintf(_("Password for user %s: "),
+										   realusername);
+			else
+				password_prompt = pg_strdup(_("Password: "));
 			PQfinish(pset.db);
+
 			simple_prompt(password_prompt, password, sizeof(password), false);
+			free(password_prompt);
 			have_password = true;
 			new_pass = true;
 		}
 	} while (new_pass);
-
-	free(password_prompt);
 
 	if (PQstatus(pset.db) == CONNECTION_BAD)
 	{
@@ -457,6 +471,7 @@ parse_psql_options(int argc, char *argv[], struct adhoc_opts *options)
 		{"expanded", no_argument, NULL, 'x'},
 		{"no-psqlrc", no_argument, NULL, 'X'},
 		{"help", optional_argument, NULL, 1},
+		{"csv", no_argument, NULL, 2},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -646,6 +661,9 @@ parse_psql_options(int argc, char *argv[], struct adhoc_opts *options)
 
 					exit(EXIT_SUCCESS);
 				}
+				break;
+			case 2:
+				pset.popt.topt.format = PRINT_CSV;
 				break;
 			default:
 		unknown_option:

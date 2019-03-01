@@ -4,7 +4,7 @@
  *	  header file for postgres vacuum cleaner and statistics analyzer
  *
  *
- * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/commands/vacuum.h
@@ -15,6 +15,7 @@
 #define VACUUM_H
 
 #include "access/htup.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_type.h"
 #include "nodes/parsenodes.h"
@@ -29,8 +30,8 @@
  * so they live until the end of the ANALYZE operation.
  *
  * The type-specific typanalyze function is passed a pointer to this struct
- * and must return TRUE to continue analysis, FALSE to skip analysis of this
- * column.  In the TRUE case it must set the compute_stats and minrows fields,
+ * and must return true to continue analysis, false to skip analysis of this
+ * column.  In the true case it must set the compute_stats and minrows fields,
  * and can optionally set extra_data to pass additional info to compute_stats.
  * minrows is its request for the minimum number of sample rows to be gathered
  * (but note this request might not be honored, eg if there are fewer rows
@@ -45,15 +46,17 @@
  * The fetchfunc may be called with rownum running from 0 to samplerows-1.
  * It returns a Datum and an isNull flag.
  *
- * compute_stats should set stats_valid TRUE if it is able to compute
+ * compute_stats should set stats_valid true if it is able to compute
  * any useful statistics.  If it does, the remainder of the struct holds
  * the information to be stored in a pg_statistic row for the column.  Be
  * careful to allocate any pointed-to data in anl_context, which will NOT
  * be CurrentMemoryContext when compute_stats is called.
  *
- * Note: for the moment, all comparisons done for statistical purposes
- * should use the database's default collation (DEFAULT_COLLATION_OID).
- * This might change in some future release.
+ * Note: all comparisons done for statistical purposes should use the
+ * underlying column's collation (attcollation), except in situations
+ * where a noncollatable container type contains a collatable type;
+ * in that case use the type's default collation.  Be sure to record
+ * the appropriate collation in stacoll.
  *----------
  */
 typedef struct VacAttrStats *VacAttrStatsP;
@@ -77,16 +80,18 @@ typedef struct VacAttrStats
 	 * because some index opclasses store a different type than the underlying
 	 * column/expression.  Instead use attrtypid, attrtypmod, and attrtype for
 	 * information about the datatype being fed to the typanalyze function.
+	 * Likewise, use attrcollid not attr->attcollation.
 	 */
 	Form_pg_attribute attr;		/* copy of pg_attribute row for column */
 	Oid			attrtypid;		/* type of data being analyzed */
 	int32		attrtypmod;		/* typmod of data being analyzed */
 	Form_pg_type attrtype;		/* copy of pg_type row for attrtypid */
+	Oid			attrcollid;		/* collation of data being analyzed */
 	MemoryContext anl_context;	/* where to save long-lived data */
 
 	/*
 	 * These fields must be filled in by the typanalyze routine, unless it
-	 * returns FALSE.
+	 * returns false.
 	 */
 	AnalyzeAttrComputeStatsFunc compute_stats;	/* function pointer */
 	int			minrows;		/* Minimum # of rows wanted for stats */
@@ -102,6 +107,7 @@ typedef struct VacAttrStats
 	float4		stadistinct;	/* # distinct values */
 	int16		stakind[STATISTIC_NUM_SLOTS];
 	Oid			staop[STATISTIC_NUM_SLOTS];
+	Oid			stacoll[STATISTIC_NUM_SLOTS];
 	int			numnumbers[STATISTIC_NUM_SLOTS];
 	float4	   *stanumbers[STATISTIC_NUM_SLOTS];
 	int			numvalues[STATISTIC_NUM_SLOTS];
@@ -157,13 +163,12 @@ extern int	vacuum_multixact_freeze_table_age;
 
 /* in commands/vacuum.c */
 extern void ExecVacuum(VacuumStmt *vacstmt, bool isTopLevel);
-extern void vacuum(int options, RangeVar *relation, Oid relid,
-	   VacuumParams *params, List *va_cols,
+extern void vacuum(int options, List *relations, VacuumParams *params,
 	   BufferAccessStrategy bstrategy, bool isTopLevel);
 extern void vac_open_indexes(Relation relation, LOCKMODE lockmode,
 				 int *nindexes, Relation **Irel);
 extern void vac_close_indexes(int nindexes, Relation *Irel, LOCKMODE lockmode);
-extern double vac_estimate_reltuples(Relation relation, bool is_analyze,
+extern double vac_estimate_reltuples(Relation relation,
 					   BlockNumber total_pages,
 					   BlockNumber scanned_pages,
 					   double scanned_tuples);
@@ -186,10 +191,10 @@ extern void vacuum_set_xid_limits(Relation rel,
 					  MultiXactId *mxactFullScanLimit);
 extern void vac_update_datfrozenxid(void);
 extern void vacuum_delay_point(void);
-
-/* in commands/vacuumlazy.c */
-extern void lazy_vacuum_rel(Relation onerel, int options,
-				VacuumParams *params, BufferAccessStrategy bstrategy);
+extern bool vacuum_is_relation_owner(Oid relid, Form_pg_class reltuple,
+						 int options);
+extern Relation vacuum_open_relation(Oid relid, RangeVar *relation,
+					 VacuumParams *params, int options, LOCKMODE lmode);
 
 /* in commands/analyze.c */
 extern void analyze_rel(Oid relid, RangeVar *relation, int options,

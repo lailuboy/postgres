@@ -232,23 +232,23 @@ SELECT *, pg_typeof(f1) FROM
 (3 rows)
 
 -- ... unless there's context to suggest differently
-explain verbose select '42' union all select '43';
-                   QUERY PLAN                    
--------------------------------------------------
- Append  (cost=0.00..0.04 rows=2 width=32)
-   ->  Result  (cost=0.00..0.01 rows=1 width=32)
+explain (verbose, costs off) select '42' union all select '43';
+         QUERY PLAN         
+----------------------------
+ Append
+   ->  Result
          Output: '42'::text
-   ->  Result  (cost=0.00..0.01 rows=1 width=32)
+   ->  Result
          Output: '43'::text
 (5 rows)
 
-explain verbose select '42' union all select 43;
-                   QUERY PLAN                   
-------------------------------------------------
- Append  (cost=0.00..0.04 rows=2 width=4)
-   ->  Result  (cost=0.00..0.01 rows=1 width=4)
+explain (verbose, costs off) select '42' union all select 43;
+     QUERY PLAN     
+--------------------
+ Append
+   ->  Result
          Output: 42
-   ->  Result  (cost=0.00..0.01 rows=1 width=4)
+   ->  Result
          Output: 43
 (5 rows)
 
@@ -679,6 +679,20 @@ with q as (select max(f1) from int4_tbl group by f1 order by f1)
 (5 rows)
 
 --
+-- Test case for sublinks pulled up into joinaliasvars lists in an
+-- inherited update/delete query
+--
+begin;  --  this shouldn't delete anything, but be safe
+delete from road
+where exists (
+  select 1
+  from
+    int4_tbl cross join
+    ( select f1, array(select q1 from int8_tbl) as arr
+      from text_tbl ) ss
+  where road.name = ss.f1 );
+rollback;
+--
 -- Test case for sublinks pushed down into subselects via join alias expansion
 --
 select
@@ -827,6 +841,36 @@ select exists(select * from nocolumns);
 (1 row)
 
 --
+-- Check behavior with a SubPlan in VALUES (bug #14924)
+--
+select val.x
+  from generate_series(1,10) as s(i),
+  lateral (
+    values ((select s.i + 1)), (s.i + 101)
+  ) as val(x)
+where s.i < 10 and (select val.x) < 110;
+  x  
+-----
+   2
+ 102
+   3
+ 103
+   4
+ 104
+   5
+ 105
+   6
+ 106
+   7
+ 107
+   8
+ 108
+   9
+ 109
+  10
+(17 rows)
+
+--
 -- Check sane behavior with nested IN SubLinks
 --
 explain (verbose, costs off)
@@ -860,7 +904,7 @@ select * from int4_tbl where
 --
 explain (verbose, costs off)
 select * from int4_tbl o where (f1, f1) in
-  (select f1, generate_series(1,2) / 10 g from int4_tbl i group by f1);
+  (select f1, generate_series(1,50) / 10 g from int4_tbl i group by f1);
                             QUERY PLAN                             
 -------------------------------------------------------------------
  Nested Loop Semi Join
@@ -874,9 +918,9 @@ select * from int4_tbl o where (f1, f1) in
                Output: "ANY_subquery".f1, "ANY_subquery".g
                Filter: ("ANY_subquery".f1 = "ANY_subquery".g)
                ->  Result
-                     Output: i.f1, ((generate_series(1, 2)) / 10)
+                     Output: i.f1, ((generate_series(1, 50)) / 10)
                      ->  ProjectSet
-                           Output: generate_series(1, 2), i.f1
+                           Output: generate_series(1, 50), i.f1
                            ->  HashAggregate
                                  Output: i.f1
                                  Group Key: i.f1
@@ -885,7 +929,7 @@ select * from int4_tbl o where (f1, f1) in
 (19 rows)
 
 select * from int4_tbl o where (f1, f1) in
-  (select f1, generate_series(1,2) / 10 g from int4_tbl i group by f1);
+  (select f1, generate_series(1,50) / 10 g from int4_tbl i group by f1);
  f1 
 ----
   0
@@ -955,7 +999,7 @@ select * from
                         QUERY PLAN                        
 ----------------------------------------------------------
  Subquery Scan on ss
-   Output: x, u
+   Output: ss.x, ss.u
    Filter: tattle(ss.x, 8)
    ->  ProjectSet
          Output: 9, unnest('{1,2,3,11,12,13}'::integer[])
@@ -1017,7 +1061,7 @@ select * from
                         QUERY PLAN                        
 ----------------------------------------------------------
  Subquery Scan on ss
-   Output: x, u
+   Output: ss.x, ss.u
    Filter: tattle(ss.x, ss.u)
    ->  ProjectSet
          Output: 9, unnest('{1,2,3,11,12,13}'::integer[])
@@ -1093,3 +1137,176 @@ select * from (select pk,c2 from sq_limit order by c1,pk) as x limit 3;
 
 drop function explain_sq_limit();
 drop table sq_limit;
+--
+-- Ensure that backward scan direction isn't propagated into
+-- expression subqueries (bug #15336)
+--
+begin;
+declare c1 scroll cursor for
+ select * from generate_series(1,4) i
+  where i <> all (values (2),(3));
+move forward all in c1;
+fetch backward all in c1;
+ i 
+---
+ 4
+ 1
+(2 rows)
+
+commit;
+--
+-- Tests for CTE inlining behavior
+--
+-- Basic subquery that can be inlined
+explain (verbose, costs off)
+with x as (select * from (select f1 from subselect_tbl) ss)
+select * from x where f1 = 1;
+            QUERY PLAN            
+----------------------------------
+ Seq Scan on public.subselect_tbl
+   Output: subselect_tbl.f1
+   Filter: (subselect_tbl.f1 = 1)
+(3 rows)
+
+-- Explicitly request materialization
+explain (verbose, costs off)
+with x as materialized (select * from (select f1 from subselect_tbl) ss)
+select * from x where f1 = 1;
+                QUERY PLAN                
+------------------------------------------
+ CTE Scan on x
+   Output: x.f1
+   Filter: (x.f1 = 1)
+   CTE x
+     ->  Seq Scan on public.subselect_tbl
+           Output: subselect_tbl.f1
+(6 rows)
+
+-- Stable functions are safe to inline
+explain (verbose, costs off)
+with x as (select * from (select f1, now() from subselect_tbl) ss)
+select * from x where f1 = 1;
+            QUERY PLAN             
+-----------------------------------
+ Seq Scan on public.subselect_tbl
+   Output: subselect_tbl.f1, now()
+   Filter: (subselect_tbl.f1 = 1)
+(3 rows)
+
+-- Volatile functions prevent inlining
+explain (verbose, costs off)
+with x as (select * from (select f1, random() from subselect_tbl) ss)
+select * from x where f1 = 1;
+                  QUERY PLAN                  
+----------------------------------------------
+ CTE Scan on x
+   Output: x.f1, x.random
+   Filter: (x.f1 = 1)
+   CTE x
+     ->  Seq Scan on public.subselect_tbl
+           Output: subselect_tbl.f1, random()
+(6 rows)
+
+-- SELECT FOR UPDATE cannot be inlined
+explain (verbose, costs off)
+with x as (select * from (select f1 from subselect_tbl for update) ss)
+select * from x where f1 = 1;
+                             QUERY PLAN                             
+--------------------------------------------------------------------
+ CTE Scan on x
+   Output: x.f1
+   Filter: (x.f1 = 1)
+   CTE x
+     ->  Subquery Scan on ss
+           Output: ss.f1
+           ->  LockRows
+                 Output: subselect_tbl.f1, subselect_tbl.ctid
+                 ->  Seq Scan on public.subselect_tbl
+                       Output: subselect_tbl.f1, subselect_tbl.ctid
+(10 rows)
+
+-- Multiply-referenced CTEs are inlined only when requested
+explain (verbose, costs off)
+with x as (select * from (select f1, now() as n from subselect_tbl) ss)
+select * from x, x x2 where x.n = x2.n;
+                QUERY PLAN                 
+-------------------------------------------
+ Merge Join
+   Output: x.f1, x.n, x2.f1, x2.n
+   Merge Cond: (x.n = x2.n)
+   CTE x
+     ->  Seq Scan on public.subselect_tbl
+           Output: subselect_tbl.f1, now()
+   ->  Sort
+         Output: x.f1, x.n
+         Sort Key: x.n
+         ->  CTE Scan on x
+               Output: x.f1, x.n
+   ->  Sort
+         Output: x2.f1, x2.n
+         Sort Key: x2.n
+         ->  CTE Scan on x x2
+               Output: x2.f1, x2.n
+(16 rows)
+
+explain (verbose, costs off)
+with x as not materialized (select * from (select f1, now() as n from subselect_tbl) ss)
+select * from x, x x2 where x.n = x2.n;
+                                 QUERY PLAN                                 
+----------------------------------------------------------------------------
+ Result
+   Output: subselect_tbl.f1, now(), subselect_tbl_1.f1, now()
+   One-Time Filter: (now() = now())
+   ->  Nested Loop
+         Output: subselect_tbl.f1, subselect_tbl_1.f1
+         ->  Seq Scan on public.subselect_tbl
+               Output: subselect_tbl.f1, subselect_tbl.f2, subselect_tbl.f3
+         ->  Materialize
+               Output: subselect_tbl_1.f1
+               ->  Seq Scan on public.subselect_tbl subselect_tbl_1
+                     Output: subselect_tbl_1.f1
+(11 rows)
+
+-- Check handling of outer references
+explain (verbose, costs off)
+with x as (select * from int4_tbl)
+select * from (with y as (select * from x) select * from y) ss;
+         QUERY PLAN          
+-----------------------------
+ Seq Scan on public.int4_tbl
+   Output: int4_tbl.f1
+(2 rows)
+
+explain (verbose, costs off)
+with x as materialized (select * from int4_tbl)
+select * from (with y as (select * from x) select * from y) ss;
+             QUERY PLAN              
+-------------------------------------
+ CTE Scan on x
+   Output: x.f1
+   CTE x
+     ->  Seq Scan on public.int4_tbl
+           Output: int4_tbl.f1
+(5 rows)
+
+-- Ensure that we inline the currect CTE when there are
+-- multiple CTEs with the same name
+explain (verbose, costs off)
+with x as (select 1 as y)
+select * from (with x as (select 2 as y) select * from x) ss;
+ QUERY PLAN  
+-------------
+ Result
+   Output: 2
+(2 rows)
+
+-- Row marks are not pushed into CTEs
+explain (verbose, costs off)
+with x as (select * from subselect_tbl)
+select * from x for update;
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Seq Scan on public.subselect_tbl
+   Output: subselect_tbl.f1, subselect_tbl.f2, subselect_tbl.f3
+(2 rows)
+

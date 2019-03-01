@@ -6,7 +6,7 @@
  * Generic code supporting statistics objects created via CREATE STATISTICS.
  *
  *
- * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -17,12 +17,11 @@
 #include "postgres.h"
 
 #include "access/genam.h"
-#include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/table.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_statistic_ext.h"
-#include "nodes/relation.h"
 #include "postmaster/autovacuum.h"
 #include "statistics/extended_stats_internal.h"
 #include "statistics/statistics.h"
@@ -74,11 +73,12 @@ BuildRelationExtStatistics(Relation onerel, double totalrows,
 	MemoryContext cxt;
 	MemoryContext oldcxt;
 
-	cxt = AllocSetContextCreate(CurrentMemoryContext, "stats ext",
+	cxt = AllocSetContextCreate(CurrentMemoryContext,
+								"BuildRelationExtStatistics",
 								ALLOCSET_DEFAULT_SIZES);
 	oldcxt = MemoryContextSwitchTo(cxt);
 
-	pg_stext = heap_open(StatisticExtRelationId, RowExclusiveLock);
+	pg_stext = table_open(StatisticExtRelationId, RowExclusiveLock);
 	stats = fetch_statentries_for_relation(pg_stext, RelationGetRelid(onerel));
 
 	foreach(lc, stats)
@@ -95,15 +95,16 @@ BuildRelationExtStatistics(Relation onerel, double totalrows,
 		 */
 		stats = lookup_var_attr_stats(onerel, stat->columns,
 									  natts, vacattrstats);
-		if (!stats && !IsAutoVacuumWorkerProcess())
+		if (!stats)
 		{
-			ereport(WARNING,
-					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-					 errmsg("statistics object \"%s.%s\" could not be computed for relation \"%s.%s\"",
-							stat->schema, stat->name,
-							get_namespace_name(onerel->rd_rel->relnamespace),
-							RelationGetRelationName(onerel)),
-					 errtable(onerel)));
+			if (!IsAutoVacuumWorkerProcess())
+				ereport(WARNING,
+						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+						 errmsg("statistics object \"%s.%s\" could not be computed for relation \"%s.%s\"",
+								stat->schema, stat->name,
+								get_namespace_name(onerel->rd_rel->relnamespace),
+								RelationGetRelationName(onerel)),
+						 errtable(onerel)));
 			continue;
 		}
 
@@ -128,7 +129,7 @@ BuildRelationExtStatistics(Relation onerel, double totalrows,
 		statext_store(pg_stext, stat->statOid, ndistinct, dependencies, stats);
 	}
 
-	heap_close(pg_stext, RowExclusiveLock);
+	table_close(pg_stext, RowExclusiveLock);
 
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextDelete(cxt);
@@ -157,7 +158,7 @@ statext_is_kind_built(HeapTuple htup, char type)
 			elog(ERROR, "unexpected statistics type requested: %d", type);
 	}
 
-	return !heap_attisnull(htup, attnum);
+	return !heap_attisnull(htup, attnum, NULL);
 }
 
 /*
@@ -194,8 +195,8 @@ fetch_statentries_for_relation(Relation pg_statext, Oid relid)
 		Form_pg_statistic_ext staForm;
 
 		entry = palloc0(sizeof(StatExtEntry));
-		entry->statOid = HeapTupleGetOid(htup);
 		staForm = (Form_pg_statistic_ext) GETSTRUCT(htup);
+		entry->statOid = staForm->oid;
 		entry->schema = get_namespace_name(staForm->stxnamespace);
 		entry->name = pstrdup(NameStr(staForm->stxname));
 		for (i = 0; i < staForm->stxkeys.dim1; i++)
@@ -300,9 +301,9 @@ statext_store(Relation pg_stext, Oid statOid,
 	bool		nulls[Natts_pg_statistic_ext];
 	bool		replaces[Natts_pg_statistic_ext];
 
-	memset(nulls, 1, Natts_pg_statistic_ext * sizeof(bool));
-	memset(replaces, 0, Natts_pg_statistic_ext * sizeof(bool));
-	memset(values, 0, Natts_pg_statistic_ext * sizeof(Datum));
+	memset(nulls, true, sizeof(nulls));
+	memset(replaces, false, sizeof(replaces));
+	memset(values, 0, sizeof(values));
 
 	/*
 	 * Construct a new pg_statistic_ext tuple, replacing the calculated stats.
@@ -361,18 +362,18 @@ multi_sort_init(int ndims)
 }
 
 /*
- * Prepare sort support info using the given sort operator
+ * Prepare sort support info using the given sort operator and collation
  * at the position 'sortdim'
  */
 void
-multi_sort_add_dimension(MultiSortSupport mss, int sortdim, Oid oper)
+multi_sort_add_dimension(MultiSortSupport mss, int sortdim,
+						 Oid oper, Oid collation)
 {
 	SortSupport ssup = &mss->ssup[sortdim];
 
 	ssup->ssup_cxt = CurrentMemoryContext;
-	ssup->ssup_collation = DEFAULT_COLLATION_OID;
+	ssup->ssup_collation = collation;
 	ssup->ssup_nulls_first = false;
-	ssup->ssup_cxt = CurrentMemoryContext;
 
 	PrepareSortSupportFromOrderingOp(oper, ssup);
 }

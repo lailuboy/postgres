@@ -3,7 +3,7 @@
  * pgstatfuncs.c
  *	  Functions for accessing the statistics collector data
  *
- * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -21,6 +21,7 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "postmaster/bgworker_internals.h"
 #include "postmaster/postmaster.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
@@ -540,7 +541,7 @@ pg_stat_get_progress_info(PG_FUNCTION_ARGS)
 Datum
 pg_stat_get_activity(PG_FUNCTION_ARGS)
 {
-#define PG_STAT_GET_ACTIVITY_COLS	24
+#define PG_STAT_GET_ACTIVITY_COLS	26
 	int			num_backends = pgstat_fetch_stat_numbackends();
 	int			curr_backend;
 	int			pid = PG_ARGISNULL(0) ? -1 : PG_GETARG_INT32(0);
@@ -644,26 +645,12 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 		else
 			nulls[16] = true;
 
-		if (beentry->st_ssl)
-		{
-			values[18] = BoolGetDatum(true);	/* ssl */
-			values[19] = CStringGetTextDatum(beentry->st_sslstatus->ssl_version);
-			values[20] = CStringGetTextDatum(beentry->st_sslstatus->ssl_cipher);
-			values[21] = Int32GetDatum(beentry->st_sslstatus->ssl_bits);
-			values[22] = BoolGetDatum(beentry->st_sslstatus->ssl_compression);
-			values[23] = CStringGetTextDatum(beentry->st_sslstatus->ssl_clientdn);
-		}
-		else
-		{
-			values[18] = BoolGetDatum(false);	/* ssl */
-			nulls[19] = nulls[20] = nulls[21] = nulls[22] = nulls[23] = true;
-		}
-
 		/* Values only available to role member or pg_read_all_stats */
 		if (has_privs_of_role(GetUserId(), beentry->st_userid) ||
 			is_member_of_role(GetUserId(), DEFAULT_ROLE_READ_ALL_STATS))
 		{
 			SockAddr	zero_clientaddr;
+			char	   *clipped_activity;
 
 			switch (beentry->st_state)
 			{
@@ -690,7 +677,9 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 					break;
 			}
 
-			values[5] = CStringGetTextDatum(beentry->st_activity);
+			clipped_activity = pgstat_clip_activity(beentry->st_activity_raw);
+			values[5] = CStringGetTextDatum(clipped_activity);
+			pfree(clipped_activity);
 
 			proc = BackendPidGetProc(beentry->st_procpid);
 			if (proc != NULL)
@@ -809,7 +798,7 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 					 */
 					nulls[12] = true;
 					nulls[13] = true;
-					values[14] = DatumGetInt32(-1);
+					values[14] = Int32GetDatum(-1);
 				}
 				else
 				{
@@ -820,8 +809,52 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 				}
 			}
 			/* Add backend type */
-			values[17] =
-				CStringGetTextDatum(pgstat_get_backend_desc(beentry->st_backendType));
+			if (beentry->st_backendType == B_BG_WORKER)
+			{
+				const char *bgw_type;
+
+				bgw_type = GetBackgroundWorkerTypeByPid(beentry->st_procpid);
+				if (bgw_type)
+					values[17] = CStringGetTextDatum(bgw_type);
+				else
+					nulls[17] = true;
+			}
+			else
+				values[17] =
+					CStringGetTextDatum(pgstat_get_backend_desc(beentry->st_backendType));
+
+			/* SSL information */
+			if (beentry->st_ssl)
+			{
+				values[18] = BoolGetDatum(true);	/* ssl */
+				values[19] = CStringGetTextDatum(beentry->st_sslstatus->ssl_version);
+				values[20] = CStringGetTextDatum(beentry->st_sslstatus->ssl_cipher);
+				values[21] = Int32GetDatum(beentry->st_sslstatus->ssl_bits);
+				values[22] = BoolGetDatum(beentry->st_sslstatus->ssl_compression);
+
+				if (beentry->st_sslstatus->ssl_client_dn[0])
+					values[23] = CStringGetTextDatum(beentry->st_sslstatus->ssl_client_dn);
+				else
+					nulls[23] = true;
+
+				if (beentry->st_sslstatus->ssl_client_serial[0])
+					values[24] = DirectFunctionCall3(numeric_in,
+													 CStringGetDatum(beentry->st_sslstatus->ssl_client_serial),
+													 ObjectIdGetDatum(InvalidOid),
+													 Int32GetDatum(-1));
+				else
+					nulls[24] = true;
+
+				if (beentry->st_sslstatus->ssl_issuer_dn[0])
+					values[25] = CStringGetTextDatum(beentry->st_sslstatus->ssl_issuer_dn);
+				else
+					nulls[25] = true;
+			}
+			else
+			{
+				values[18] = BoolGetDatum(false);	/* ssl */
+				nulls[19] = nulls[20] = nulls[21] = nulls[22] = nulls[23] = nulls[24] = nulls[25] = true;
+			}
 		}
 		else
 		{
@@ -838,6 +871,14 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 			nulls[13] = true;
 			nulls[14] = true;
 			nulls[17] = true;
+			nulls[18] = true;
+			nulls[19] = true;
+			nulls[20] = true;
+			nulls[21] = true;
+			nulls[22] = true;
+			nulls[23] = true;
+			nulls[24] = true;
+			nulls[25] = true;
 		}
 
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
@@ -906,17 +947,23 @@ pg_stat_get_backend_activity(PG_FUNCTION_ARGS)
 	int32		beid = PG_GETARG_INT32(0);
 	PgBackendStatus *beentry;
 	const char *activity;
+	char	   *clipped_activity;
+	text	   *ret;
 
 	if ((beentry = pgstat_fetch_stat_beentry(beid)) == NULL)
 		activity = "<backend information not available>";
 	else if (!has_privs_of_role(GetUserId(), beentry->st_userid))
 		activity = "<insufficient privilege>";
-	else if (*(beentry->st_activity) == '\0')
+	else if (*(beentry->st_activity_raw) == '\0')
 		activity = "<command string not enabled>";
 	else
-		activity = beentry->st_activity;
+		activity = beentry->st_activity_raw;
 
-	PG_RETURN_TEXT_P(cstring_to_text(activity));
+	clipped_activity = pgstat_clip_activity(activity);
+	ret = cstring_to_text(activity);
+	pfree(clipped_activity);
+
+	PG_RETURN_TEXT_P(ret);
 }
 
 Datum
@@ -1808,7 +1855,7 @@ pg_stat_get_archiver(PG_FUNCTION_ARGS)
 	MemSet(nulls, 0, sizeof(nulls));
 
 	/* Initialise attributes information in the tuple descriptor */
-	tupdesc = CreateTemplateTupleDesc(7, false);
+	tupdesc = CreateTemplateTupleDesc(7);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "archived_count",
 					   INT8OID, -1, 0);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 2, "last_archived_wal",
